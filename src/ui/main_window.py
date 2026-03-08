@@ -368,6 +368,8 @@ class MainWindow(QMainWindow):
 
         # Tool options → canvas
         self._tool_options.tool_settings_changed.connect(self._canvas_widget.update)
+        self._tool_options.tool_settings_changed.connect(self._canvas_widget.sync_text_settings)
+        self._canvas_widget.text_object_selected.connect(self._tool_options.set_text_font)
 
         # Transform tool: tool_options ↔ canvas_widget bidirectional sync
         self._tool_options.transform_flip_h.connect(self._canvas_widget.flip_transform_h)
