@@ -1,0 +1,16 @@
+# Roblox Outfit Studio - Python 3.11 compatible dependencies
+# Install with: pip install -r requirements.txt
+
+# GUI framework
+PyQt6>=6.4.0
+
+# Image processing
+Pillow>=9.5.0
+numpy>=1.24.0
+
+# 3D rendering (OpenGL)
+PyOpenGL>=3.1.7
+PyOpenGL_accelerate>=3.1.7
+
+# Testing
+pytest>=7.4.0
