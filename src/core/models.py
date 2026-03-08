@@ -44,6 +44,30 @@ class ToolType(Enum):
     SELECT = "select"
 
 
+
+class BrushType(Enum):
+    """All available brush types."""
+    HARD_ROUND       = "hard_round"
+    SOFT_ROUND       = "soft_round"
+    AIRBRUSH         = "airbrush"
+    SMUDGE           = "smudge"
+    BLEND            = "blend"
+    CHALK            = "chalk"
+    CHARCOAL         = "charcoal"
+    PENCIL           = "pencil"
+    INK              = "ink"
+    CALLIGRAPHY      = "calligraphy"
+    FLAT             = "flat"
+    TEXTURE          = "texture"
+    SCATTER          = "scatter"
+    WATERCOLOR       = "watercolor"
+    OIL              = "oil"
+    DRY_BRUSH        = "dry_brush"
+    MARKER           = "marker"
+    ERASER_SOFT      = "eraser_soft"
+    ERASER_HARD      = "eraser_hard"
+    PATTERN          = "pattern"
+
 @dataclass
 class Color:
     """RGBA color with helpers."""
@@ -231,6 +255,9 @@ class ToolSettings:
     font_size: int = 24
     snap_to_grid: bool = False
     grid_size: int = 16
+    brush_type: "BrushType" = field(default_factory=lambda: BrushType.SOFT_ROUND)
+    shape_line_width: int = 2
+    text_content: str = "Text"
 
 
 @dataclass
