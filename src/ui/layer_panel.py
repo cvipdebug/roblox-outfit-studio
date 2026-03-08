@@ -65,7 +65,7 @@ class LayerPanel(QWidget):
         # Header
         hdr = QHBoxLayout()
         title = QLabel("LAYERS")
-        title.setStyleSheet("color: #a6adc8; font-size: 10px; font-weight: bold; letter-spacing: 2px;")
+        title.setStyleSheet("color: #a6adc8; font-size: 8pt; font-weight: bold; letter-spacing: 2px;")
         hdr.addWidget(title)
         hdr.addStretch()
         root.addLayout(hdr)
