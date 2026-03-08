@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 from PIL import Image as PILImage
 
-from PyQt6.QtWidgets import QWidget, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QSizePolicy, QInputDialog
 from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, QRect, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QImage, QPixmap, QPen, QColor, QBrush,
@@ -26,7 +26,7 @@ from core.models import CanvasState, ToolSettings, ToolType, Color, BlendMode, L
 from core.paint_engine import (
     paint_brush_stroke, paint_line, erase_brush_stroke,
     flood_fill, draw_rectangle, draw_ellipse, draw_line_shape,
-    draw_text, pick_color,
+    draw_text, measure_text, pick_color,
 )
 from core.history import HistoryManager
 
@@ -56,6 +56,7 @@ class CanvasWidget(QWidget):
     status_message        = pyqtSignal(str)
     transform_display_update = pyqtSignal(float, float, float, float, float)
     # ^ x, y, scale_x, scale_y, rotation — to sync tool_options spinboxes
+    text_object_selected = pyqtSignal(str, int)   # font_name, font_size
 
     def __init__(self, canvas: CanvasState, tools: ToolSettings, parent=None):
         super().__init__(parent)
@@ -91,6 +92,15 @@ class CanvasWidget(QWidget):
 
         self._composite_cache: Optional[QPixmap] = None
         self._cache_dirty:     bool = True
+
+        # Text objects: list of dicts with keys:
+        #   text, x, y, color, font_name, font_size, layer_index
+        self._text_objects: list = []
+        self._active_text_idx: int = -1   # index into _text_objects, -1=none selected
+        self._last_text_idx:   int = -1   # last selected/created — for font size updates
+        self._text_dragging:   bool = False
+        self._text_drag_off:   tuple = (0, 0)  # offset from text origin to click
+
         self._rebuild_composite()
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -120,7 +130,27 @@ class CanvasWidget(QWidget):
         self.update()
 
     def _rebuild_composite(self):
+        from PIL import Image as _PILI, ImageDraw as _PILID, ImageFont as _PILIF
         flat = self._canvas.flatten()
+        # Draw live text objects on top (not yet baked)
+        if self._text_objects:
+            draw = _PILID.Draw(flat, "RGBA")
+            for i, obj in enumerate(self._text_objects):
+                try:
+                    font = _PILIF.truetype(obj['font_name'], max(1, obj['font_size']))
+                except Exception:
+                    font = _PILIF.load_default()
+                c = obj['color']
+                draw.text((obj['x'], obj['y']), obj['text'],
+                           fill=(c.r, c.g, c.b, c.a), font=font)
+                # Draw selection box around active text
+                if i == self._active_text_idx:
+                    tw, th = measure_text(obj['text'], obj['font_name'], obj['font_size'])
+                    tw = max(tw, 20); th = max(th, obj['font_size'])
+                    draw.rectangle(
+                        [obj['x']-2, obj['y']-2, obj['x']+tw+2, obj['y']+th+2],
+                        outline=(80, 160, 255, 200), width=1
+                    )
         self._composite_cache = _pil_to_pixmap(flat)
         self._cache_dirty = False
 
@@ -347,6 +377,7 @@ class CanvasWidget(QWidget):
                 p.drawEllipse(pt, HANDLE_R, HANDLE_R)
                 # Arrow symbol
                 p.setPen(QPen(QColor(80, 40, 0), 1.5))
+                p.setFont(QFont("Arial", 9))
                 p.drawText(QRectF(pt.x()-6, pt.y()-6, 12, 12),
                            Qt.AlignmentFlag.AlignCenter, "↻")
             elif is_corner:
@@ -500,6 +531,14 @@ class CanvasWidget(QWidget):
 
         if tool == ToolType.FILL:
             self._push_history()
+            if layer.source_pixels is not None:
+                from PIL import Image as _bI
+                import numpy as _np2
+                raw = _bI.fromarray(layer.source_pixels, "RGBA")
+                baked = layer.transform.apply_to_pil(raw, self._canvas.width, self._canvas.height)
+                layer.pixels = _np2.array(baked, dtype=_np2.uint8)
+                layer.source_pixels = None
+                layer.transform = LayerTransform()
             flood_fill(layer.pixels, cx, cy, self._tools.primary_color, self._tools.fill_tolerance)
             self._invalidate_cache()
             self.canvas_changed.emit(self._canvas.flatten())
@@ -507,20 +546,70 @@ class CanvasWidget(QWidget):
 
         if tool in (ToolType.RECTANGLE, ToolType.ELLIPSE, ToolType.LINE):
             self._push_history()
+            if layer.source_pixels is not None:
+                from PIL import Image as _sI
+                import numpy as _np3
+                raw = _sI.fromarray(layer.source_pixels, "RGBA")
+                baked = layer.transform.apply_to_pil(raw, self._canvas.width, self._canvas.height)
+                layer.pixels = _np3.array(baked, dtype=_np3.uint8)
+                layer.source_pixels = None
+                layer.transform = LayerTransform()
             self._shape_start          = (cx, cy)
             self._shape_preview_pixels = layer.pixels.copy()
             self._drawing              = True
             return
 
         if tool == ToolType.TEXT:
-            self._push_history()
-            draw_text(layer.pixels, cx, cy, "Sample Text",
-                      self._tools.primary_color, self._tools.font_name, self._tools.font_size)
-            self._invalidate_cache()
-            self.canvas_changed.emit(self._canvas.flatten())
+            # Check if clicking an existing text object
+            hit = self._text_hit(cx, cy)
+            if hit >= 0:
+                # Select it for dragging / editing
+                self._active_text_idx = hit
+                self._last_text_idx   = hit
+                tx = self._text_objects[hit]
+                self._text_dragging  = True
+                self._text_drag_off  = (cx - tx['x'], cy - tx['y'])
+                # Push object settings back to tool so panel reflects them
+                self._tools.font_name  = tx['font_name']
+                self._tools.font_size  = tx['font_size']
+                self._tools.primary_color = tx['color']
+                self.text_object_selected.emit(tx['font_name'], tx['font_size'])
+                self.update()
+                return
+            # Deselect any existing selection on empty click
+            self._active_text_idx = -1
+            text, ok = QInputDialog.getText(
+                self, "Add Text", "Enter text:",
+                text=getattr(self._tools, "text_content", "Text")
+            )
+            if ok and text.strip():
+                self._tools.text_content = text
+                obj = {
+                    'text':       text,
+                    'x':          cx,
+                    'y':          cy,
+                    'color':      self._tools.primary_color,
+                    'font_name':  self._tools.font_name,
+                    'font_size':  self._tools.font_size,
+                    'layer_index': self._canvas.active_layer_index,
+                }
+                self._text_objects.append(obj)
+                self._active_text_idx = len(self._text_objects) - 1
+                self._last_text_idx   = self._active_text_idx
+                self._invalidate_cache()
             return
 
         self._push_history()
+        # If this layer has an imported image (source_pixels), bake it into
+        # pixels first so the user can paint on top of it directly.
+        if layer.source_pixels is not None:
+            from PIL import Image as _bakeI
+            raw  = _bakeI.fromarray(layer.source_pixels, "RGBA")
+            baked = layer.transform.apply_to_pil(raw, self._canvas.width, self._canvas.height)
+            import numpy as _np
+            layer.pixels      = _np.array(baked, dtype=_np.uint8)
+            layer.source_pixels = None
+            layer.transform   = LayerTransform()
         self._drawing         = True
         self._last_canvas_pos = (cx, cy)
         self._apply_brush(cx, cy)
@@ -571,6 +660,15 @@ class CanvasWidget(QWidget):
                     pass
             self.status_message.emit(f"X:{cx}  Y:{cy}{color_str}  Zoom:{self._zoom*100:.0f}%")
 
+        # Text drag (must be before drawing check)
+        tool = self._tools.tool
+        if tool == ToolType.TEXT and self._text_dragging and self._active_text_idx >= 0:
+            obj = self._text_objects[self._active_text_idx]
+            obj['x'] = cx - self._text_drag_off[0]
+            obj['y'] = cy - self._text_drag_off[1]
+            self._invalidate_cache()
+            return
+
         self.update()
 
         if not self._drawing:
@@ -585,12 +683,13 @@ class CanvasWidget(QWidget):
             preview = self._shape_preview_pixels.copy()
             sx, sy  = self._shape_start
             c       = self._tools.primary_color
+            _lw = getattr(self._tools, 'shape_line_width', 2)
             if tool == ToolType.RECTANGLE:
-                draw_rectangle(preview, sx, sy, cx, cy, c, False, 2)
+                draw_rectangle(preview, sx, sy, cx, cy, c, False, _lw)
             elif tool == ToolType.ELLIPSE:
-                draw_ellipse(preview, sx, sy, cx, cy, c, False, 2)
+                draw_ellipse(preview, sx, sy, cx, cy, c, False, _lw)
             elif tool == ToolType.LINE:
-                draw_line_shape(preview, sx, sy, cx, cy, c, 2)
+                draw_line_shape(preview, sx, sy, cx, cy, c, _lw)
             self._composite_cache = _pil_to_pixmap(self._make_preview_flat(preview, layer))
             self._cache_dirty = False
             self.update()
@@ -598,9 +697,11 @@ class CanvasWidget(QWidget):
 
         if tool in (ToolType.BRUSH, ToolType.ERASER) and self._last_canvas_pos:
             if tool == ToolType.BRUSH:
+                _bt = getattr(self._tools, 'brush_type', None)
                 paint_line(layer.pixels, self._last_canvas_pos, (cx, cy),
                            self._tools.primary_color, self._tools.brush_size,
-                           self._tools.brush_hardness, self._tools.brush_opacity)
+                           self._tools.brush_hardness, self._tools.brush_opacity,
+                           brush_type=_bt, stroke_seed=cx ^ cy)
             else:
                 x0, y0 = self._last_canvas_pos
                 dist   = math.hypot(cx-x0, cy-y0)
@@ -674,6 +775,10 @@ class CanvasWidget(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
 
+        # Stop text drag
+        if self._text_dragging:
+            self._text_dragging = False
+
         if self._tx_dragging != H_NONE:
             self._tx_dragging   = H_NONE
             self._tx_drag_start = None
@@ -700,12 +805,13 @@ class CanvasWidget(QWidget):
             )
             sx, sy = self._shape_start
             c = self._tools.primary_color
+            lw = getattr(self._tools, "shape_line_width", 2)
             if tool == ToolType.RECTANGLE:
-                draw_rectangle(layer.pixels, sx, sy, cx, cy, c, False, 2)
+                draw_rectangle(layer.pixels, sx, sy, cx, cy, c, False, lw)
             elif tool == ToolType.ELLIPSE:
-                draw_ellipse(layer.pixels, sx, sy, cx, cy, c, False, 2)
+                draw_ellipse(layer.pixels, sx, sy, cx, cy, c, False, lw)
             elif tool == ToolType.LINE:
-                draw_line_shape(layer.pixels, sx, sy, cx, cy, c, 2)
+                draw_line_shape(layer.pixels, sx, sy, cx, cy, c, lw)
             self._shape_start = None; self._shape_preview_pixels = None
             self._invalidate_cache()
             self.canvas_changed.emit(self._canvas.flatten())
@@ -714,6 +820,51 @@ class CanvasWidget(QWidget):
             self.canvas_changed.emit(self._canvas.flatten())
 
         self._drawing = False; self._last_canvas_pos = None
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click a text object to edit it."""
+        if self._tools.tool != ToolType.TEXT:
+            return
+        wx, wy = event.pos().x(), event.pos().y()
+        cx_f, cy_f = self._widget_to_canvas(wx, wy)
+        cx, cy = int(cx_f), int(cy_f)
+        hit = self._text_hit(cx, cy)
+        if hit >= 0:
+            obj = self._text_objects[hit]
+            text, ok = QInputDialog.getText(
+                self, "Edit Text", "Edit text:", text=obj['text']
+            )
+            if ok and text.strip():
+                obj['text'] = text
+                self._invalidate_cache()
+            elif ok and not text.strip():
+                # Empty text = delete
+                self._bake_text(hit)
+                del self._text_objects[hit]
+                self._active_text_idx = -1
+                self._invalidate_cache()
+
+    def keyPressEvent(self, event):
+        """Delete key removes the selected text object."""
+        from PyQt6.QtCore import Qt as _Qt
+        if (self._tools.tool == ToolType.TEXT
+                and event.key() == _Qt.Key.Key_Delete
+                and self._active_text_idx >= 0):
+            self._bake_text(self._active_text_idx)
+            del self._text_objects[self._active_text_idx]
+            self._active_text_idx = -1
+            self._invalidate_cache()
+            return
+        # Also: Enter/Return while text selected = bake it
+        if (self._tools.tool == ToolType.TEXT
+                and event.key() in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter)
+                and self._active_text_idx >= 0):
+            self._bake_text(self._active_text_idx)
+            del self._text_objects[self._active_text_idx]
+            self._active_text_idx = -1
+            self._invalidate_cache()
+            return
+        super().keyPressEvent(event)
 
     def leaveEvent(self, event):
         self._mouse_widget_pos = None
@@ -784,15 +935,58 @@ class CanvasWidget(QWidget):
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    def sync_text_settings(self):
+        """Called whenever tool settings change — update the selected text object.
+        Uses _last_text_idx as fallback so font size changes work even after
+        the selection is cleared (e.g. after closing the text dialog)."""
+        idx = self._active_text_idx
+        if idx < 0:
+            idx = self._last_text_idx
+        if idx < 0 or idx >= len(self._text_objects):
+            return
+        obj = self._text_objects[idx]
+        obj['font_name'] = self._tools.font_name
+        obj['font_size'] = self._tools.font_size
+        obj['color']     = self._tools.primary_color
+        self._invalidate_cache()
+
+    def _text_hit(self, cx, cy):
+        """Return index of text object under canvas point (cx,cy), or -1."""
+        for i, obj in enumerate(self._text_objects):
+            tw, th = measure_text(obj['text'], obj['font_name'], obj['font_size'])
+            tw = max(tw, 20); th = max(th, obj['font_size'])
+            if (obj['x'] <= cx <= obj['x'] + tw and
+                    obj['y'] <= cy <= obj['y'] + th):
+                return i
+        return -1
+
+    def _bake_text(self, idx):
+        """Permanently render a text object into its layer pixels."""
+        if idx < 0 or idx >= len(self._text_objects):
+            return
+        obj = self._text_objects[idx]
+        li  = obj['layer_index']
+        if 0 <= li < len(self._canvas.layers):
+            layer = self._canvas.layers[li]
+            if not layer.locked:
+                self._push_history()
+                draw_text(layer.pixels, obj['x'], obj['y'], obj['text'],
+                          obj['color'], obj['font_name'], obj['font_size'])
+                self.canvas_changed.emit(self._canvas.flatten())
+
     def _apply_brush(self, cx: int, cy: int):
         layer = self._canvas.active_layer
         if layer is None:
             return
         tool = self._tools.tool
+        bt = getattr(self._tools, 'brush_type', None)
+        prev = self._last_canvas_pos
+        px, py = (prev[0], prev[1]) if prev else (cx, cy)
         if tool == ToolType.BRUSH:
             paint_brush_stroke(layer.pixels, cx, cy, self._tools.primary_color,
                                self._tools.brush_size, self._tools.brush_hardness,
-                               self._tools.brush_opacity)
+                               self._tools.brush_opacity, bt, px, py,
+                               stroke_seed=cx ^ cy)
         elif tool == ToolType.ERASER:
             erase_brush_stroke(layer.pixels, cx, cy, self._tools.brush_size,
                                self._tools.brush_hardness, self._tools.brush_opacity)
