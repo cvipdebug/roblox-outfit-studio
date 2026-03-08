@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFont
 from ui.main_window import MainWindow
 
 
@@ -20,6 +20,13 @@ from core.resources import resource_path
 def main() -> None:
     """Launch the Roblox Outfit Studio application."""
     app = QApplication(sys.argv)
+    # Set a base font with an explicit point size BEFORE any stylesheet.
+    # Without this, stylesheets that use "font-size: Npx" can produce
+    # a calculated point size of -1 on some Windows DPI configurations,
+    # causing "QFont::setPointSize: Point size <= 0" warnings everywhere.
+    _base_font = QFont("Segoe UI", 10)
+    _base_font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(_base_font)
     app.setApplicationName("Roblox Outfit Studio")
     app.setApplicationVersion("1.0.0")
     app.setOrganizationName("OutfitStudio")
@@ -46,7 +53,7 @@ def _get_stylesheet() -> str:
         background-color: #1e1e2e;
         color: #cdd6f4;
         font-family: 'Segoe UI', Arial, sans-serif;
-        font-size: 13px;
+        font-size: 10pt;
     }
     QMenuBar {
         background-color: #181825;
@@ -180,7 +187,7 @@ def _get_stylesheet() -> str:
         margin-top: 8px;
         padding-top: 4px;
         color: #a6adc8;
-        font-size: 11px;
+        font-size: 8pt;;
     }
     QGroupBox::title {
         subcontrol-origin: margin;
