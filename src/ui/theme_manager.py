@@ -147,7 +147,7 @@ QMainWindow, QDialog {{
 QWidget {{
     background: {t['window_bg']};
     color: {t['text']};
-    font-size: 12px;
+    font-size: 9pt;
 }}
 QDockWidget {{
     background: {t['panel_bg']};
@@ -160,7 +160,7 @@ QDockWidget::title {{
     padding: 4px;
     font-weight: bold;
     color: {t['text_dim']};
-    font-size: 10px;
+    font-size: 8pt;
     letter-spacing: 1px;
 }}
 QToolBar {{
@@ -175,7 +175,7 @@ QToolButton {{
     border: 1px solid {t['border']};
     border-radius: 4px;
     padding: 3px;
-    font-size: 13px;
+    font-size: 10pt;
 }}
 QToolButton:hover {{
     background: {t['button_hover']};
@@ -205,7 +205,7 @@ QMenuBar {{
     background: {t['toolbar_bg']};
     color: {t['text']};
     border-bottom: 1px solid {t['border']};
-    font-size: 13px;
+    font-size: 10pt;
     padding: 1px 4px;
 }}
 QMenuBar::item {{
@@ -222,7 +222,7 @@ QMenu {{
     color: {t['text']};
     border: 1px solid {t['border']};
     padding: 4px 0px;
-    font-size: 13px;
+    font-size: 10pt;
 }}
 QMenu::item {{
     padding: 6px 36px 6px 24px;
@@ -336,7 +336,7 @@ QGroupBox {{
     margin-top: 8px;
     padding-top: 4px;
     color: {t['text_dim']};
-    font-size: 10px;
+    font-size: 8pt;
     font-weight: bold;
     letter-spacing: 1px;
 }}
@@ -516,7 +516,7 @@ class ThemeEditorDialog(QDialog):
         btn.setText(hex_color)
         btn.setStyleSheet(
             f"background:{hex_color}; color:{text_color}; "
-            f"border:1px solid #555; border-radius:3px; font-size:10px;"
+            f"border:1px solid #555; border-radius:3px; font-size: 8pt;"
         )
 
     def _pick_color(self, key: str, btn: QPushButton) -> None:
