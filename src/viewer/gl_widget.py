@@ -30,7 +30,7 @@ try:
         GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST,
         GL_LIGHTING, GL_LIGHT0, GL_COLOR_MATERIAL, GL_SMOOTH,
         GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE,
-        GL_AMBIENT, GL_DIFFUSE, GL_QUADS, GL_LINES, GL_TEXTURE_2D,
+        GL_AMBIENT, GL_DIFFUSE, GL_QUADS, GL_LINES, GL_TRIANGLES, GL_TRIANGLE_FAN, GL_TEXTURE_2D,
         GL_LINEAR, GL_CLAMP_TO_EDGE, GL_RGBA, GL_UNSIGNED_BYTE,
         GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
         GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
@@ -476,8 +476,7 @@ class AvatarViewerWidget(QOpenGLWidget):
             cx, cy, cz = center
             hw, hh, hd = half
             if part == "head":
-                draw_part(cx, cy, cz, hw, hh, hd, None, None, 0, 0, SKIN)
-                self._draw_eyes(cx, cy, cz, hw, hh, hd)
+                self._draw_roblox_head(cx, cy, cz, hw, hh, hd)
             elif part == "torso":
                 draw_part(cx, cy, cz, hw, hh, hd,
                           SHIRT_FACES.get("torso"),
@@ -487,23 +486,119 @@ class AvatarViewerWidget(QOpenGLWidget):
                           SHIRT_FACES.get(part),
                           PANTS_FACES.get(part), s, p, SKIN)
 
-    def _draw_eyes(self, cx, cy, cz, hw, hh, hd):
+    def _draw_roblox_head(self, cx, cy, cz, hw, hh, hd):
+        """
+        Roblox R6 head rendered as a superellipsoid (smooth rounded box).
+        Uses parametric superellipse: |x/a|^n + |y/b|^n + |z/c|^n = 1, n=4.
+        This gives a box-like shape with fully rounded edges and corners on
+        ALL sides, matching the classic Roblox head appearance.
+        """
         if not OPENGL_AVAILABLE:
             return
-        glDisable(GL_LIGHTING)
+        import math as _m
+
+        skin = SKIN
+        SEGS_U = 20   # longitude subdivisions (around)
+        SEGS_V = 16   # latitude subdivisions (pole to pole)
+        N = 4.0       # superellipsoid exponent (higher = more box-like)
+
+        def _sgn(v):
+            return 1.0 if v >= 0 else -1.0
+
+        def _se_pt(u, v):
+            """
+            Superellipsoid parametric surface.
+            u in [0, 2pi], v in [-pi/2, pi/2]
+            Returns (point, normal) scaled to head half-extents.
+            """
+            cu = _m.cos(u); su = _m.sin(u)
+            cv = _m.cos(v); sv = _m.sin(v)
+            # Superellipse terms with sign preservation
+            def _sp(val, exp):
+                a = abs(val)
+                return _sgn(val) * (a ** exp if a > 1e-9 else 0.0)
+            e = 2.0 / N   # exponent for surface
+            px = hw * _sp(cu, e) * _sp(cv, e)
+            py = hh * _sp(sv, e)
+            pz = hd * _sp(su, e) * _sp(cv, e)
+            # Normal from gradient of implicit function
+            ne = N - 1.0
+            nx = (abs(cu*cv)**ne * _sgn(cu*cv)) / (hw + 1e-9)
+            ny = (abs(sv)    **ne * _sgn(sv))    / (hh + 1e-9)
+            nz = (abs(su*cv)**ne * _sgn(su*cv)) / (hd + 1e-9)
+            mag = _m.sqrt(nx*nx + ny*ny + nz*nz) + 1e-9
+            return (cx+px, cy+py, cz+pz), (nx/mag, ny/mag, nz/mag)
+
         glDisable(GL_TEXTURE_2D)
-        glColor3f(*DARK)
-        ez = cz + hd + 0.003
-        ey = cy + hh * 0.12
-        es = hw * 0.11
-        for ex in (cx - hw * 0.30, cx + hw * 0.30):
-            glBegin(GL_QUADS)
-            glVertex3f(ex-es, ey-es, ez)
-            glVertex3f(ex+es, ey-es, ez)
-            glVertex3f(ex+es, ey+es, ez)
-            glVertex3f(ex-es, ey+es, ez)
-            glEnd()
         glEnable(GL_LIGHTING)
+        glColor3f(*skin)
+
+        # Draw as quad grid
+        for j in range(SEGS_V):
+            v0 = -_m.pi/2 + _m.pi * j       / SEGS_V
+            v1 = -_m.pi/2 + _m.pi * (j+1)   / SEGS_V
+            for i in range(SEGS_U):
+                u0 = 2*_m.pi * i       / SEGS_U
+                u1 = 2*_m.pi * (i+1)   / SEGS_U
+                p00, n00 = _se_pt(u0, v0)
+                p01, n01 = _se_pt(u1, v0)
+                p10, n10 = _se_pt(u0, v1)
+                p11, n11 = _se_pt(u1, v1)
+                # Shade front face (z+) slightly warmer
+                if p00[2] > cz+hd*0.6 or p01[2] > cz+hd*0.6:
+                    glColor3f(skin[0]*1.02, skin[1]*0.99, skin[2]*0.94)
+                else:
+                    glColor3f(*skin)
+                glBegin(GL_QUADS)
+                glNormal3f(*n00); glVertex3f(*p00)
+                glNormal3f(*n01); glVertex3f(*p01)
+                glNormal3f(*n11); glVertex3f(*p11)
+                glNormal3f(*n10); glVertex3f(*p10)
+                glEnd()
+
+        # ── Face features on front of head ────────────────────────────────────
+        glDisable(GL_LIGHTING)
+        ez = cz + hd + 0.006
+
+        # Eyes — filled ovals
+        eye_rx = hw * 0.09; eye_ry = hh * 0.10
+        eye_y  = cy + hh * 0.08
+        glColor3f(0.08, 0.06, 0.05)
+        for eye_cx in (cx - hw*0.27, cx + hw*0.27):
+            segs = 14
+            for i in range(segs):
+                a0 = 2*_m.pi * i       / segs
+                a1 = 2*_m.pi * (i+1)   / segs
+                glBegin(GL_TRIANGLES)
+                glVertex3f(eye_cx, eye_y, ez)
+                glVertex3f(eye_cx + eye_rx*_m.cos(a0), eye_y + eye_ry*_m.sin(a0), ez)
+                glVertex3f(eye_cx + eye_rx*_m.cos(a1), eye_y + eye_ry*_m.sin(a1), ez)
+                glEnd()
+
+        # Smile — thick arc
+        sm_cx = cx; sm_cy = cy - hh*0.22
+        sm_rx = hw*0.28; sm_ry = hh*0.13; sm_th = hh*0.038
+        a_start = _m.radians(210); a_end = _m.radians(330)
+        sm_segs = 14
+        glColor3f(0.15, 0.08, 0.06)
+        for i in range(sm_segs):
+            a0 = a_start + (a_end - a_start) * i       / sm_segs
+            a1 = a_start + (a_end - a_start) * (i+1)   / sm_segs
+            ox0 = sm_cx+(sm_rx+sm_th)*_m.cos(a0); oy0 = sm_cy+(sm_ry+sm_th)*_m.sin(a0)
+            ox1 = sm_cx+(sm_rx+sm_th)*_m.cos(a1); oy1 = sm_cy+(sm_ry+sm_th)*_m.sin(a1)
+            ix0 = sm_cx+(sm_rx-sm_th)*_m.cos(a0); iy0 = sm_cy+(sm_ry-sm_th)*_m.sin(a0)
+            ix1 = sm_cx+(sm_rx-sm_th)*_m.cos(a1); iy1 = sm_cy+(sm_ry-sm_th)*_m.sin(a1)
+            glBegin(GL_QUADS)
+            glVertex3f(ox0,oy0,ez); glVertex3f(ox1,oy1,ez)
+            glVertex3f(ix1,iy1,ez); glVertex3f(ix0,iy0,ez)
+            glEnd()
+
+        glEnable(GL_LIGHTING)
+
+
+    def _draw_eyes(self, cx, cy, cz, hw, hh, hd):
+        """Legacy — now handled by _draw_roblox_head."""
+        pass
 
     def _paint_fallback(self):
         from PyQt6.QtGui import QPainter, QColor, QFont
