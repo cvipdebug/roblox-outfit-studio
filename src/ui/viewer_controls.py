@@ -130,5 +130,5 @@ class ViewerControlsPanel(QWidget):
             "🖱 Right drag: pan\n"
             "🖱 Scroll: zoom"
         )
-        hint.setStyleSheet("color: #585b70; font-size: 11px;")
+        hint.setStyleSheet("color: #585b70; font-size: 8pt;;")
         root.addWidget(hint)
