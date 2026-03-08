@@ -10,13 +10,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
-from core.models import ToolSettings, ToolType, Color
+from core.models import ToolSettings, ToolType, BrushType, Color
 
 # ─── Shared stylesheet fragments ──────────────────────────────────────────────
 
 _GRP = """
 QGroupBox {
-    font-size: 10px; font-weight: bold; letter-spacing: 1px;
+    font-size: 8pt; font-weight: bold; letter-spacing: 1px;
     color: #7888aa; border: 1px solid #383858; border-radius: 5px;
     margin-top: 8px; padding-top: 2px;
 }
@@ -26,7 +26,7 @@ QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }
 _SPIN = """
 QDoubleSpinBox, QSpinBox {
     color: #dde; background: #22223a; border: 1px solid #454565;
-    border-radius: 3px; padding: 0 2px; font-size: 11px;
+    border-radius: 3px; padding: 0 2px; font-size: 8pt;
 }
 QDoubleSpinBox::up-button, QSpinBox::up-button {
     subcontrol-origin: border; subcontrol-position: top right;
@@ -54,7 +54,7 @@ QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover { background: #38
 _BTN = """
 QPushButton {
     color: #ccd; background: #28283e; border: 1px solid #454565;
-    border-radius: 3px; font-size: 11px; padding: 2px 6px;
+    border-radius: 3px; font-size: 8pt; padding: 2px 6px;
 }
 QPushButton:hover { background: #323250; }
 QPushButton:pressed { background: #1c1c30; }
@@ -63,7 +63,7 @@ QPushButton:pressed { background: #1c1c30; }
 _APPLY = """
 QPushButton {
     color: #fff; background: #286028; border: 1px solid #4a904a;
-    border-radius: 3px; font-size: 11px; font-weight: bold; padding: 2px 6px;
+    border-radius: 3px; font-size: 8pt; font-weight: bold; padding: 2px 6px;
 }
 QPushButton:hover { background: #327832; }
 QPushButton:pressed { background: #1c401c; }
@@ -78,7 +78,7 @@ QSlider::handle:horizontal {
 }
 """
 
-_LBL = "color: #aab; font-size: 11px;"
+_LBL = "color: #aab; font-size: 8pt;"
 
 H = 24   # standard row height
 
@@ -187,7 +187,7 @@ class ToolOptionsPanel(QWidget):
         self._hex.setPlaceholderText("#RRGGBB"); self._hex.setFixedHeight(H)
         self._hex.setStyleSheet(
             "QLineEdit{color:#dde;background:#22223a;border:1px solid #454565;"
-            "border-radius:3px;padding:0 4px;font-size:11px;}"
+            "border-radius:3px;padding:0 4px;font-size: 8pt;}"
             "QLineEdit:focus{border:1px solid #7080c0;}")
         self._hex.editingFinished.connect(self._on_hex)
         row2.addWidget(self._hex); cl.addLayout(row2)
@@ -198,6 +198,46 @@ class ToolOptionsPanel(QWidget):
         self._sz_sl, self._sz_sp = self._slide_row(bl, "Size", 1, 500, self._s.brush_size, self._on_sz)
         self._hd_sl, self._hd_lb = self._pct_row(bl, "Hard", int(self._s.brush_hardness*100), self._on_hd)
         self._op_sl, self._op_lb = self._pct_row(bl, "Opac", int(self._s.brush_opacity*100),  self._on_op)
+
+        # Brush type dropdown
+        bt_row = QHBoxLayout(); bt_row.setSpacing(5)
+        bt_row.addWidget(_lbl("Type:", 30))
+        self._brush_type_combo = QComboBox()
+        self._brush_type_combo.setFixedHeight(H)
+        self._brush_type_combo.setStyleSheet(
+            "QComboBox{color:#dde;background:#22223a;border:1px solid #454565;"
+            "border-radius:3px;padding:0 4px;font-size: 8pt;}"
+            "QComboBox::drop-down{border-left:1px solid #454565;width:16px;}"
+            "QComboBox QAbstractItemView{background:#22223a;color:#dde;selection-background-color:#3a4a80;}")
+        self._brush_type_names = [
+            ("Hard Round",    BrushType.HARD_ROUND),
+            ("Soft Round",    BrushType.SOFT_ROUND),
+            ("Airbrush",      BrushType.AIRBRUSH),
+            ("Smudge",        BrushType.SMUDGE),
+            ("Blend",         BrushType.BLEND),
+            ("Chalk",         BrushType.CHALK),
+            ("Charcoal",      BrushType.CHARCOAL),
+            ("Pencil",        BrushType.PENCIL),
+            ("Ink / Lineart", BrushType.INK),
+            ("Calligraphy",   BrushType.CALLIGRAPHY),
+            ("Flat / Square", BrushType.FLAT),
+            ("Texture",       BrushType.TEXTURE),
+            ("Scatter",       BrushType.SCATTER),
+            ("Watercolor",    BrushType.WATERCOLOR),
+            ("Oil Paint",     BrushType.OIL),
+            ("Dry Brush",     BrushType.DRY_BRUSH),
+            ("Marker",        BrushType.MARKER),
+            ("Eraser (soft)", BrushType.ERASER_SOFT),
+            ("Eraser (hard)", BrushType.ERASER_HARD),
+            ("Pattern",       BrushType.PATTERN),
+        ]
+        for name, _ in self._brush_type_names:
+            self._brush_type_combo.addItem(name)
+        # Set default to Soft Round (index 1)
+        self._brush_type_combo.setCurrentIndex(1)
+        self._brush_type_combo.currentIndexChanged.connect(self._on_brush_type)
+        bt_row.addWidget(self._brush_type_combo, 1)
+        bl.addLayout(bt_row)
         root.addWidget(self._bg_brush)
 
         # ── Fill ──────────────────────────────────────────────────────────────
@@ -213,7 +253,7 @@ class ToolOptionsPanel(QWidget):
         self._font.addItems(["Arial","Times New Roman","Courier New","Georgia","Verdana","Impact"])
         self._font.setCurrentText(self._s.font_name); self._font.setFixedHeight(H)
         self._font.setStyleSheet("QComboBox{color:#dde;background:#22223a;border:1px solid #454565;"
-            "border-radius:3px;padding:0 4px;font-size:11px;}"
+            "border-radius:3px;padding:0 4px;font-size: 8pt;}"
             "QComboBox::drop-down{border-left:1px solid #454565;width:16px;}"
             "QComboBox QAbstractItemView{background:#22223a;color:#dde;selection-background-color:#3a4a80;}")
         self._font.currentTextChanged.connect(self._on_font)
@@ -225,6 +265,17 @@ class ToolOptionsPanel(QWidget):
         self._fsize.valueChanged.connect(self._on_fsize)
         sr.addWidget(self._fsize); sr.addStretch(); tl.addLayout(sr)
         root.addWidget(self._bg_text)
+
+        # ── Shape options ─────────────────────────────────────────────────────
+        self._bg_shape, shl = _grp("SHAPE")
+        shl_row = QHBoxLayout(); shl_row.setSpacing(5)
+        shl_row.addWidget(_lbl("Width:", 38))
+        self._shape_lw = _spin(1, 100, self._s.shape_line_width)
+        self._shape_lw.setToolTip("Stroke thickness in pixels")
+        self._shape_lw.valueChanged.connect(self._on_shape_lw)
+        shl_row.addWidget(self._shape_lw); shl_row.addStretch()
+        shl.addLayout(shl_row)
+        root.addWidget(self._bg_shape)
 
         # ── Transform ─────────────────────────────────────────────────────────
         self._bg_tx, txl = _grp("TRANSFORM")
@@ -245,7 +296,7 @@ class ToolOptionsPanel(QWidget):
         self._lock_btn.setText("🔗"); self._lock_btn.setCheckable(True); self._lock_btn.setChecked(True)
         self._lock_btn.setFixedSize(20, 20)
         self._lock_btn.setStyleSheet(
-            "QToolButton{background:#28283e;border:1px solid #454565;border-radius:3px;font-size:11px;}"
+            "QToolButton{background:#28283e;border:1px solid #454565;border-radius:3px;font-size: 8pt;}"
             "QToolButton:checked{background:#38386a;border-color:#7080c0;}"
             "QToolButton:hover{background:#323250;}")
         self._lock_btn.toggled.connect(lambda v: setattr(self,'_lock',v) or
@@ -286,7 +337,7 @@ class ToolOptionsPanel(QWidget):
         # ── Grid ──────────────────────────────────────────────────────────────
         gg, gl = _grp("GRID")
         self._snap = QCheckBox("Snap to Grid")
-        self._snap.setStyleSheet("QCheckBox{color:#aab;font-size:11px;}")
+        self._snap.setStyleSheet("QCheckBox{color:#aab;font-size: 8pt;}")
         self._snap.setChecked(self._s.snap_to_grid); self._snap.toggled.connect(self._on_snap)
         gl.addWidget(self._snap)
         gsr = QHBoxLayout(); gsr.setSpacing(6)
@@ -325,7 +376,20 @@ class ToolOptionsPanel(QWidget):
         self._bg_brush.setVisible(tool in {ToolType.BRUSH, ToolType.ERASER})
         self._bg_fill.setVisible(tool == ToolType.FILL)
         self._bg_text.setVisible(tool == ToolType.TEXT)
+        self._bg_shape.setVisible(tool in {ToolType.RECTANGLE, ToolType.ELLIPSE, ToolType.LINE})
         self._bg_tx.setVisible(tool == ToolType.TRANSFORM)
+
+    def set_text_font(self, font_name: str, font_size: int):
+        """Update font controls to reflect the selected text object."""
+        self._s.font_name = font_name
+        self._s.font_size = font_size
+        self._font.blockSignals(True)
+        self._fsize.blockSignals(True)
+        if self._font.findText(font_name) >= 0:
+            self._font.setCurrentText(font_name)
+        self._fsize.setValue(max(6, min(200, font_size)))
+        self._font.blockSignals(False)
+        self._fsize.blockSignals(False)
 
     def set_primary_color(self, color: Color):
         self._s.primary_color = color
@@ -357,9 +421,24 @@ class ToolOptionsPanel(QWidget):
     def _on_hd(self, v):  self._s.brush_hardness = v/100;   self.tool_settings_changed.emit()
     def _on_op(self, v):  self._s.brush_opacity  = v/100;   self.tool_settings_changed.emit()
     def _on_tol(self, v): self._s.fill_tolerance = v;        self.tool_settings_changed.emit()
-    def _on_font(self, n): self._s.font_name = n;            self.tool_settings_changed.emit()
-    def _on_fsize(self, v): self._s.font_size = v;           self.tool_settings_changed.emit()
+    def _on_font(self, n):
+        if self._upd: return
+        self._s.font_name = n
+        self.tool_settings_changed.emit()
+    def _on_fsize(self, v):
+        if self._upd: return
+        self._s.font_size = v
+        self.tool_settings_changed.emit()
     def _on_snap(self, v): self._s.snap_to_grid = v;         self.tool_settings_changed.emit()
+
+    def _on_brush_type(self, idx):
+        _, bt = self._brush_type_names[idx]
+        self._s.brush_type = bt
+        self.tool_settings_changed.emit()
+
+    def _on_shape_lw(self, v):
+        self._s.shape_line_width = v
+        self.tool_settings_changed.emit()
     def _on_gsize(self, v): self._s.grid_size = v;           self.tool_settings_changed.emit()
 
     def _rot_by(self, d):
