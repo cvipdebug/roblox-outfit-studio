@@ -253,6 +253,22 @@ class ToolSettings:
     fill_tolerance: int = 32
     font_name: str = "Arial"
     font_size: int = 24
+    symmetry_axis: object = None   # SymmetryAxis enum value, None = off
+    fill_selection_only: bool = False
+    recent_colors: list = field(default_factory=list)   # up to 16 Color objects
+    palette_colors: list = field(default_factory=lambda: [
+        Color(0,0,0,255), Color(255,255,255,255),
+        Color(255,0,0,255), Color(0,255,0,255), Color(0,0,255,255),
+        Color(255,255,0,255), Color(255,128,0,255), Color(128,0,255,255),
+        Color(255,0,128,255), Color(0,255,255,255), Color(128,64,0,255),
+        Color(64,64,64,255), Color(128,128,128,255), Color(192,192,192,255),
+        Color(0,128,0,255), Color(0,0,128,255),
+    ])
+
+    def __post_init__(self):
+        from core.models import SymmetryAxis as _SA
+        if self.symmetry_axis is None:
+            self.symmetry_axis = _SA.NONE
     snap_to_grid: bool = False
     grid_size: int = 16
     brush_type: "BrushType" = field(default_factory=lambda: BrushType.SOFT_ROUND)
@@ -344,33 +360,55 @@ class CanvasState:
 
 
 def _composite_blend(base: Image.Image, top: Image.Image, mode: BlendMode) -> Image.Image:
-    """Apply a blend mode between two RGBA PIL images."""
+    """Apply a blend mode between two RGBA PIL images using proper alpha compositing."""
     if mode == BlendMode.NORMAL:
-        result = Image.alpha_composite(base, top)
-    elif mode == BlendMode.MULTIPLY:
-        base_arr = np.array(base, dtype=np.float32) / 255.0
-        top_arr = np.array(top, dtype=np.float32) / 255.0
-        rgb = base_arr[..., :3] * top_arr[..., :3]
-        alpha = np.maximum(base_arr[..., 3:], top_arr[..., 3:])
-        blended = np.clip(np.concatenate([rgb, alpha], axis=2) * 255, 0, 255).astype(np.uint8)
-        result = Image.fromarray(blended, "RGBA")
+        return Image.alpha_composite(base, top)
+
+    b = np.array(base, dtype=np.float32) / 255.0   # base  RGBA
+    t = np.array(top,  dtype=np.float32) / 255.0   # top   RGBA
+
+    br, bg, bb, ba = b[...,0], b[...,1], b[...,2], b[...,3]
+    tr, tg, tb, ta = t[...,0], t[...,1], t[...,2], t[...,3]
+
+    bc = b[..., :3]   # base RGB
+    tc = t[..., :3]   # top  RGB
+
+    # Blend the RGB channels
+    if mode == BlendMode.MULTIPLY:
+        rgb = bc * tc
     elif mode == BlendMode.SCREEN:
-        base_arr = np.array(base, dtype=np.float32) / 255.0
-        top_arr = np.array(top, dtype=np.float32) / 255.0
-        rgb = 1.0 - (1.0 - base_arr[..., :3]) * (1.0 - top_arr[..., :3])
-        alpha = np.maximum(base_arr[..., 3:], top_arr[..., 3:])
-        blended = np.clip(np.concatenate([rgb, alpha], axis=2) * 255, 0, 255).astype(np.uint8)
-        result = Image.fromarray(blended, "RGBA")
+        rgb = 1.0 - (1.0 - bc) * (1.0 - tc)
+    elif mode == BlendMode.OVERLAY:
+        rgb = np.where(bc < 0.5,
+                       2.0 * bc * tc,
+                       1.0 - 2.0 * (1.0 - bc) * (1.0 - tc))
+    elif mode == BlendMode.SOFT_LIGHT:
+        rgb = np.where(tc < 0.5,
+                       bc - (1.0 - 2.0*tc) * bc * (1.0 - bc),
+                       bc + (2.0*tc - 1.0) * (np.sqrt(np.clip(bc, 0, 1)) - bc))
+    elif mode == BlendMode.HARD_LIGHT:
+        rgb = np.where(tc < 0.5,
+                       2.0 * bc * tc,
+                       1.0 - 2.0 * (1.0 - bc) * (1.0 - tc))
+    elif mode == BlendMode.DIFFERENCE:
+        rgb = np.abs(bc - tc)
+    elif mode == BlendMode.EXCLUSION:
+        rgb = bc + tc - 2.0 * bc * tc
     elif mode == BlendMode.ADD:
-        base_arr = np.array(base, dtype=np.float32)
-        top_arr = np.array(top, dtype=np.float32)
-        rgb = np.clip(base_arr[..., :3] + top_arr[..., :3], 0, 255)
-        alpha = np.maximum(base_arr[..., 3:], top_arr[..., 3:])
-        blended = np.concatenate([rgb, alpha], axis=2).astype(np.uint8)
-        result = Image.fromarray(blended, "RGBA")
+        rgb = np.clip(bc + tc, 0.0, 1.0)
+    elif mode == BlendMode.SUBTRACT:
+        rgb = np.clip(bc - tc, 0.0, 1.0)
     else:
-        result = Image.alpha_composite(base, top)
-    return result
+        return Image.alpha_composite(base, top)
+
+    # Porter-Duff "source over" alpha compositing with blended RGB
+    ta3 = ta[..., np.newaxis]
+    ba3 = ba[..., np.newaxis]
+    out_a = ta3 + ba3 * (1.0 - ta3)
+    safe  = np.where(out_a > 0, out_a, 1.0)
+    out_rgb = (rgb * ta3 + bc * ba3 * (1.0 - ta3)) / safe
+    out = np.clip(np.concatenate([out_rgb, out_a], axis=2) * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
 
 
 @dataclass
@@ -401,3 +439,12 @@ TEMPLATE_SIZES = {
     "face": ROBLOX_FACE_SIZE,
     "custom": (512, 512),
 }
+
+
+# ── Symmetry axis ────────────────────────────────────────────────────────────
+
+class SymmetryAxis(Enum):
+    NONE       = "none"
+    HORIZONTAL = "horizontal"   # mirror left ↔ right
+    VERTICAL   = "vertical"     # mirror top  ↔ bottom
+    BOTH       = "both"

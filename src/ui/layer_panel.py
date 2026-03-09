@@ -187,13 +187,44 @@ class LayerPanel(QWidget):
             self.layer_selected.emit(idx)
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
-        """Double-click to toggle visibility, or rename if clicking name area."""
+        """Double-click to rename the layer inline."""
+        from PyQt6.QtWidgets import QInputDialog
         idx   = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
         layer = self._canvas.layers[idx]
-        # Toggle visibility on double-click
-        layer.visible = not layer.visible
-        self.layers_changed.emit()
-        self.refresh()
+        name, ok = QInputDialog.getText(
+            self, "Rename Layer", "Layer name:", text=layer.name
+        )
+        if ok and name.strip():
+            layer.name = name.strip()
+            self.layers_changed.emit()
+            self.refresh()
+
+    def contextMenuEvent(self, event):
+        """Right-click context menu on a layer item."""
+        from PyQt6.QtWidgets import QMenu
+        item = self._list.itemAt(self._list.mapFromGlobal(event.globalPos()))
+        if item is None:
+            return
+        idx   = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        layer = self._canvas.layers[idx]
+        menu  = QMenu(self)
+        vis_act  = menu.addAction("Hide Layer" if layer.visible else "Show Layer")
+        lock_act = menu.addAction("Unlock Layer" if layer.locked else "Lock Layer")
+        menu.addSeparator()
+        ren_act  = menu.addAction("Rename…")
+        action = menu.exec(event.globalPos())
+        if action == vis_act:
+            layer.visible = not layer.visible
+            self.layers_changed.emit(); self.refresh()
+        elif action == lock_act:
+            layer.locked = not layer.locked
+            self.refresh()
+        elif action == ren_act:
+            self._on_item_double_clicked(item)
 
     def _on_rows_moved(self, *args):
         if self._updating:

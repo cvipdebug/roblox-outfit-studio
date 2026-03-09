@@ -48,6 +48,7 @@ TOOLS = [
     ("ellipse",    "⬭",  "Ellipse (C)",        "C",  ToolType.ELLIPSE),
     ("line",       "╱",  "Line (L)",           "L",  ToolType.LINE),
     ("text",       "T",  "Text (T)",           "",   ToolType.TEXT),
+    ("select",     "⬚",  "Select (S)",         "S",  ToolType.SELECT),
     ("transform",  "⇲",  "Transform (V)",      "V",  ToolType.TRANSFORM),
 ]
 
@@ -93,6 +94,11 @@ class MainWindow(QMainWindow):
 
         # Initial 3D push
         self._sync_timer.start()
+
+        # Auto-save + crash recovery (after UI is ready)
+        self._autosave_path   = ""
+        self._autosave_timer  = None
+        self._setup_autosave()
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -144,8 +150,8 @@ class MainWindow(QMainWindow):
         viewer_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
-        viewer_dock.setMinimumWidth(200)
-        viewer_dock.setMaximumWidth(280)
+        viewer_dock.setMinimumWidth(240)
+        viewer_dock.setMaximumWidth(340)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, viewer_dock)
 
         # Status bar
@@ -245,6 +251,12 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        roblox_export_act = QAction("Export for Roblox Upload…", self)
+        roblox_export_act.setShortcut("Ctrl+Shift+E")
+        roblox_export_act.triggered.connect(self._on_export_roblox)
+        file_menu.addAction(roblox_export_act)
+        file_menu.addSeparator()
+
         export_act = QAction("Export Texture PNG…", self)
         export_act.setShortcut(QKeySequence("Ctrl+E"))
         export_act.triggered.connect(self._on_export_texture)
@@ -276,6 +288,36 @@ class MainWindow(QMainWindow):
 
         edit_menu.addSeparator()
 
+        sel_all_act = QAction("Select All", self)
+        sel_all_act.setShortcut("Ctrl+A")
+        sel_all_act.triggered.connect(self._canvas_widget.select_all)
+        edit_menu.addAction(sel_all_act)
+
+        desel_act = QAction("Deselect", self)
+        desel_act.setShortcut("Ctrl+D")
+        desel_act.triggered.connect(self._canvas_widget.clear_selection)
+        edit_menu.addAction(desel_act)
+
+        edit_menu.addSeparator()
+
+        copy_act = QAction("Copy", self)
+        copy_act.triggered.connect(self._canvas_widget.copy_selection)
+        edit_menu.addAction(copy_act)
+
+        cut_act = QAction("Cut", self)
+        cut_act.triggered.connect(self._canvas_widget.cut_selection)
+        edit_menu.addAction(cut_act)
+
+        paste_act = QAction("Paste", self)
+        paste_act.triggered.connect(self._canvas_widget.paste_selection)
+        edit_menu.addAction(paste_act)
+
+        del_act = QAction("Delete Selection", self)
+        del_act.triggered.connect(self._canvas_widget.delete_selection)
+        edit_menu.addAction(del_act)
+
+        edit_menu.addSeparator()
+
         clear_act = QAction("Clear Active Layer", self)
         clear_act.setShortcut(QKeySequence("Delete"))
         clear_act.triggered.connect(self._on_clear_layer)
@@ -297,6 +339,17 @@ class MainWindow(QMainWindow):
 
         # ── Canvas ────────────────────────────────────────────────────────
         canvas_menu = menubar.addMenu("Canvas")
+
+        # Symmetry submenu
+        sym_menu = canvas_menu.addMenu("Symmetry")
+        for label, val in [("None", "none"), ("Horizontal ↔", "horizontal"),
+                           ("Vertical ↕", "vertical"), ("Both ✛", "both")]:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(val)
+            act.triggered.connect(lambda checked, v=val: self._on_symmetry(v))
+            sym_menu.addAction(act)
+        self._sym_menu = sym_menu
 
         shirt_act = QAction("New Shirt Template (585×559)", self)
         shirt_act.triggered.connect(lambda: self._new_from_template("shirt"))
@@ -370,6 +423,7 @@ class MainWindow(QMainWindow):
         self._tool_options.tool_settings_changed.connect(self._canvas_widget.update)
         self._tool_options.tool_settings_changed.connect(self._canvas_widget.sync_text_settings)
         self._canvas_widget.text_object_selected.connect(self._tool_options.set_text_font)
+        self._canvas_widget.recent_colors_changed.connect(self._tool_options.refresh_recent_colors)
 
         # Transform tool: tool_options ↔ canvas_widget bidirectional sync
         self._tool_options.transform_flip_h.connect(self._canvas_widget.flip_transform_h)
@@ -387,6 +441,49 @@ class MainWindow(QMainWindow):
         self._viewer_controls.auto_rotate.connect(self._viewer_widget.set_auto_rotate)
         self._viewer_controls.grid_toggled.connect(self._viewer_widget.set_show_grid)
         self._viewer_controls.template_changed.connect(self._on_template_changed)
+        self._viewer_controls.skin_color_changed.connect(self._viewer_widget.set_skin_color)
+
+    def _setup_autosave(self):
+        import tempfile
+        self._autosave_path = os.path.join(
+            tempfile.gettempdir(), "roblox_outfit_studio_recovery.outfitproj"
+        )
+        if os.path.exists(self._autosave_path):
+            reply = QMessageBox.question(
+                self, "Crash Recovery",
+                "A recovery file was found from a previous session. Restore it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    self._load_project_file(self._autosave_path)
+                    self._project_path = None
+                    self._dirty = True
+                    self._update_title()
+                    self._status_label.setText("Session recovered from auto-save.")
+                except Exception as e:
+                    QMessageBox.warning(self, "Recovery Failed", str(e))
+            try:
+                os.remove(self._autosave_path)
+            except Exception:
+                pass
+
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(120_000)
+        self._autosave_timer.timeout.connect(self._do_autosave)
+        self._autosave_timer.start()
+
+    def _do_autosave(self):
+        if not self._dirty or not self._autosave_path:
+            return
+        try:
+            from core.project_io import save_project
+            save_project(self._canvas, self._autosave_path)
+            self._status_label.setText("Auto-saved.")
+        except Exception:
+            pass
+
+
 
     # ── Tool selection ────────────────────────────────────────────────────────
 
@@ -548,6 +645,12 @@ class MainWindow(QMainWindow):
             self._dirty = False
             self._update_title()
             self._status_label.setText(f"Saved: {os.path.basename(path)}")
+            # Remove recovery file after a clean manual save
+            try:
+                if self._autosave_path and os.path.exists(self._autosave_path):
+                    os.remove(self._autosave_path)
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not save:\n{e}")
 
@@ -577,7 +680,75 @@ class MainWindow(QMainWindow):
         )
         if path:
             export_template_png(self._template_type, path)
-            self._status_label.setText("Template exported")
+
+    def _on_export_roblox(self) -> None:
+        """Export a Roblox-ready 585×559 PNG with a preview dialog."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PyQt6.QtGui import QPixmap as _QP
+        from PyQt6.QtCore import Qt as _Qt
+        import tempfile
+
+        flat = self._canvas.flatten()
+
+        # Show quick preview dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export for Roblox")
+        dlg.setMinimumWidth(420)
+        vl = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "<b>Ready to export for Roblox</b><br>"
+            "The texture will be saved as a 585×559 PNG.<br>"
+            "Upload it to Roblox Studio → Explorer → Shirt/Pants → ShirtTemplate."
+        )
+        info.setWordWrap(True)
+        vl.addWidget(info)
+
+        # Preview thumbnail
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            tmp = tf.name
+        flat.save(tmp)
+        thumb = _QP(tmp).scaledToWidth(380, _Qt.TransformationMode.SmoothTransformation)
+        os.unlink(tmp)
+        prev_lbl = QLabel(); prev_lbl.setPixmap(thumb)
+        prev_lbl.setAlignment(_Qt.AlignmentFlag.AlignCenter)
+        vl.addWidget(prev_lbl)
+
+        hl = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        save_btn = QPushButton("Save PNG…")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(dlg.accept)
+        hl.addWidget(cancel_btn); hl.addWidget(save_btn)
+        vl.addLayout(hl)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export for Roblox", "roblox_shirt.png", "PNG Image (*.png)"
+        )
+        if path:
+            try:
+                from core.project_io import export_texture
+                export_texture(self._canvas, path, self._template_type)
+                self._status_label.setText(f"Exported for Roblox: {os.path.basename(path)}")
+                QMessageBox.information(self, "Exported!",
+                    f"Saved to:\n{path}\n\nUpload this file to Roblox Studio.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Export failed:\n{e}")
+
+    def _on_symmetry(self, val: str) -> None:
+        from core.models import SymmetryAxis as _SA
+        axis_map = {"none": _SA.NONE, "horizontal": _SA.HORIZONTAL,
+                    "vertical": _SA.VERTICAL, "both": _SA.BOTH}
+        self._tools.symmetry_axis = axis_map.get(val, _SA.NONE)
+        # Update checkmarks
+        for act in self._sym_menu.actions():
+            act.setChecked(act.data() == val)
+        self._canvas_widget.update()
+        self._status_label.setText(f"Symmetry: {val.title()}")
 
     def _on_clear_layer(self) -> None:
         layer = self._canvas.active_layer
@@ -623,7 +794,7 @@ class MainWindow(QMainWindow):
                 pass  # silently fall back to blank guide
         else:
             # Fallback: generate a simple guide overlay
-            import tempfile, os
+            import tempfile
             tmp_fd, buf_path = tempfile.mkstemp(suffix=".png")
             os.close(tmp_fd)
             try:
@@ -684,29 +855,147 @@ class MainWindow(QMainWindow):
         )
 
     def _on_shortcuts(self) -> None:
-        QMessageBox.information(
-            self,
-            "Keyboard Shortcuts",
-            "<b>Tools</b><br>"
-            "B – Brush &nbsp;&nbsp; E – Eraser<br>"
-            "G – Fill &nbsp;&nbsp;&nbsp; I – Eyedropper<br>"
-            "R – Rectangle &nbsp; C – Ellipse<br>"
-            "L – Line &nbsp;&nbsp;&nbsp; V – Transform<br><br>"
-            "<b>File</b><br>"
-            "Ctrl+N – New &nbsp; Ctrl+O – Open<br>"
-            "Ctrl+S – Save &nbsp; Ctrl+E – Export &nbsp; Ctrl+Shift+E – Merge Down<br>"
-            "Ctrl+I – Import<br><br>"
-            "<b>Edit</b><br>"
-            "Ctrl+Z – Undo &nbsp; Ctrl+Y – Redo<br>"
-            "Delete – Clear Layer<br><br>"
-            "<b>View</b><br>"
-            "= / - &nbsp; Zoom In / Out<br>"
-            "0 – Fit to Window &nbsp; 1 – 100%<br><br>"
-            "<b>Canvas (Middle Mouse)</b><br>"
-            "Pan the canvas view",
-        )
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QScrollArea, QWidget, QPushButton
+        from PyQt6.QtCore import Qt as _Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        dlg.setMinimumWidth(480)
+        dlg.setMinimumHeight(540)
+        dlg.setStyleSheet("background:#1e1e2e; color:#cdd6f4; font-size:10pt;")
+
+        outer = QVBoxLayout(dlg)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;}")
+        content = QWidget()
+        vl = QVBoxLayout(content)
+        vl.setSpacing(2)
+
+        def section(title):
+            lbl = QLabel(f"<b style='color:#89b4fa;font-size:11pt;'>{title}</b>")
+            vl.addSpacing(8)
+            vl.addWidget(lbl)
+
+        def row(keys, desc):
+            from PyQt6.QtWidgets import QHBoxLayout
+            hl = QHBoxLayout(); hl.setSpacing(0)
+            k_lbl = QLabel(keys)
+            k_lbl.setStyleSheet(
+                "background:#313244;color:#cba6f7;border-radius:4px;"
+                "padding:2px 8px;font-family:monospace;font-size:9pt;")
+            k_lbl.setFixedWidth(170)
+            d_lbl = QLabel(desc)
+            d_lbl.setStyleSheet("color:#cdd6f4; padding-left:10px;")
+            hl.addWidget(k_lbl); hl.addWidget(d_lbl, 1)
+            w = QWidget(); w.setLayout(hl)
+            vl.addWidget(w)
+
+        section("🖌  Tools")
+        row("B",              "Brush")
+        row("E",              "Eraser")
+        row("G",              "Fill / Bucket")
+        row("I",              "Eyedropper")
+        row("S",              "Selection")
+        row("R",              "Rectangle")
+        row("C",              "Ellipse")
+        row("L",              "Line")
+        row("T",              "Text")
+        row("V",              "Transform")
+
+        section("📋  Selection")
+        row("Ctrl + A",       "Select All")
+        row("Ctrl + D",       "Deselect")
+        row("Ctrl + C",       "Copy Selection")
+        row("Ctrl + X",       "Cut Selection")
+        row("Ctrl + V",       "Paste")
+        row("Delete",         "Delete Selected Pixels")
+        row("Escape",         "Drop Float / Deselect")
+
+        section("📁  File")
+        row("Ctrl + N",       "New Project")
+        row("Ctrl + O",       "Open Project")
+        row("Ctrl + S",       "Save Project")
+        row("Ctrl + Shift + S","Save As…")
+        row("Ctrl + I",       "Import Image as Layer")
+        row("Ctrl + E",       "Export Texture PNG")
+        row("Ctrl + Shift + E","Export for Roblox Upload")
+
+        section("✏️  Edit")
+        row("Ctrl + Z",       "Undo")
+        row("Ctrl + Y",       "Redo")
+        row("Delete",         "Clear Active Layer (no selection)")
+        row("Ctrl + Shift + A","Apply Transform")
+
+        section("🔍  View")
+        row("=  /  -",        "Zoom In / Zoom Out")
+        row("0",              "Fit Canvas to Window")
+        row("1",              "Zoom to 100%")
+        row("Middle Mouse",   "Pan Canvas")
+        row("Scroll Wheel",   "Zoom In / Out")
+
+        section("🎨  Text Tool")
+        row("Click (empty)",  "Place new text object")
+        row("Click (text)",   "Select & drag text")
+        row("Double-click",   "Edit text content")
+        row("Enter",          "Bake text into layer")
+        row("Delete",         "Bake & remove text")
+
+        section("🔁  Symmetry  (Tool Options panel)")
+        row("H ↔",            "Mirror strokes horizontally")
+        row("V ↕",            "Mirror strokes vertically")
+        row("✛ Both",         "Mirror in both axes")
+
+        vl.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(28)
+        close_btn.setStyleSheet(
+            "QPushButton{background:#313244;color:#cdd6f4;border:1px solid #454565;"
+            "border-radius:4px;padding:0 16px;font-size:10pt;}"
+            "QPushButton:hover{background:#3a4a80;}")
+        close_btn.clicked.connect(dlg.accept)
+        outer.addWidget(close_btn)
+
+        dlg.exec()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        """Forward all shortcuts to canvas widget regardless of focus."""
+        from PyQt6.QtCore import Qt as _Qt
+        key   = event.key()
+        ctrl  = bool(event.modifiers() & _Qt.KeyboardModifier.ControlModifier)
+        shift = bool(event.modifiers() & _Qt.KeyboardModifier.ShiftModifier)
+        cw    = self._canvas_widget
+
+        # Selection
+        if ctrl and key == _Qt.Key.Key_A:
+            cw.select_all(); return
+        if ctrl and key == _Qt.Key.Key_D:
+            cw.clear_selection(); return
+        if ctrl and key == _Qt.Key.Key_C:
+            cw.copy_selection(); return
+        if ctrl and key == _Qt.Key.Key_X:
+            cw.cut_selection(); return
+        if ctrl and key == _Qt.Key.Key_V:
+            cw.paste_selection(); return
+        if key == _Qt.Key.Key_Delete:
+            if cw._tools.tool.value == "select":
+                cw.delete_selection(); return
+        if key == _Qt.Key.Key_Escape:
+            cw.clear_selection(); return
+
+        # Undo / Redo
+        if ctrl and key == _Qt.Key.Key_Z:
+            cw.undo(); return
+        if ctrl and (key == _Qt.Key.Key_Y or (shift and key == _Qt.Key.Key_Z)):
+            cw.redo(); return
+
+        super().keyPressEvent(event)
 
     def _confirm_discard(self) -> bool:
         reply = QMessageBox.question(
@@ -723,6 +1012,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Roblox Outfit Studio — {name}{dirty}")
 
     def closeEvent(self, event) -> None:
+        # Stop auto-save timer and clean up recovery file on normal exit
+        if hasattr(self, '_autosave_timer') and self._autosave_timer:
+            self._autosave_timer.stop()
+        if not self._dirty:
+            try:
+                if self._autosave_path and os.path.exists(self._autosave_path):
+                    os.remove(self._autosave_path)
+            except Exception:
+                pass
         if self._dirty:
             reply = QMessageBox.question(
                 self,

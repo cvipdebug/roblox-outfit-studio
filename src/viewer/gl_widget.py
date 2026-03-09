@@ -278,6 +278,7 @@ class AvatarViewerWidget(QOpenGLWidget):
         self._show_grid    = True
         self._auto_rotate  = False
         self._bg_color     = (0.11, 0.11, 0.16)
+        self._skin_color   = SKIN
 
         self._rot_timer = QTimer(self)
         self._rot_timer.timeout.connect(self._on_auto_rotate)
@@ -371,6 +372,9 @@ class AvatarViewerWidget(QOpenGLWidget):
     def set_ambient(self, v: float):  self._ambient = v; self.update()
     def set_diffuse(self, v: float):  self._diffuse = v; self.update()
     def set_show_grid(self, s: bool): self._show_grid = s; self.update()
+
+    def set_skin_color(self, r: float, g: float, b: float):
+        self._skin_color = (r, g, b); self.update()
 
     def set_auto_rotate(self, enabled: bool):
         self._auto_rotate = enabled
@@ -497,7 +501,7 @@ class AvatarViewerWidget(QOpenGLWidget):
             return
         import math as _m
 
-        skin = SKIN
+        skin = self._skin_color
         SEGS_U = 20   # longitude subdivisions (around)
         SEGS_V = 16   # latitude subdivisions (pole to pole)
         N = 4.0       # superellipsoid exponent (higher = more box-like)

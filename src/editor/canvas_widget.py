@@ -22,7 +22,7 @@ from PyQt6.QtGui import (
     QCursor, QMouseEvent, QWheelEvent, QPaintEvent,
     QTransform, QFont,
 )
-from core.models import CanvasState, ToolSettings, ToolType, Color, BlendMode, LayerTransform
+from core.models import CanvasState, ToolSettings, ToolType, Color, BlendMode, LayerTransform, SymmetryAxis
 from core.paint_engine import (
     paint_brush_stroke, paint_line, erase_brush_stroke,
     flood_fill, draw_rectangle, draw_ellipse, draw_line_shape,
@@ -56,7 +56,8 @@ class CanvasWidget(QWidget):
     status_message        = pyqtSignal(str)
     transform_display_update = pyqtSignal(float, float, float, float, float)
     # ^ x, y, scale_x, scale_y, rotation — to sync tool_options spinboxes
-    text_object_selected = pyqtSignal(str, int)   # font_name, font_size
+    text_object_selected  = pyqtSignal(str, int)   # font_name, font_size
+    recent_colors_changed = pyqtSignal()
 
     def __init__(self, canvas: CanvasState, tools: ToolSettings, parent=None):
         super().__init__(parent)
@@ -92,6 +93,16 @@ class CanvasWidget(QWidget):
 
         self._composite_cache: Optional[QPixmap] = None
         self._cache_dirty:     bool = True
+
+        # Selection state (None = whole canvas selected)
+        self._selection: Optional[Tuple[int,int,int,int]] = None   # x,y,w,h
+        self._sel_dragging:   bool = False
+        self._sel_start:      Optional[Tuple[int,int]] = None
+        self._sel_moving:     bool = False
+        self._sel_move_start: Optional[Tuple[int,int]] = None
+        self._sel_move_off:   Tuple[int,int] = (0, 0)
+        self._sel_float:      Optional[np.ndarray] = None   # cut/floating pixels
+        self._sel_float_pos:  Tuple[int,int] = (0, 0)
 
         # Text objects: list of dicts with keys:
         #   text, x, y, color, font_name, font_size, layer_index
@@ -130,20 +141,16 @@ class CanvasWidget(QWidget):
         self.update()
 
     def _rebuild_composite(self):
-        from PIL import Image as _PILI, ImageDraw as _PILID, ImageFont as _PILIF
+        from PIL import ImageDraw as _PID
+        from core.paint_engine import _load_font
         flat = self._canvas.flatten()
-        # Draw live text objects on top (not yet baked)
         if self._text_objects:
-            draw = _PILID.Draw(flat, "RGBA")
+            draw = _PID.Draw(flat, "RGBA")
             for i, obj in enumerate(self._text_objects):
-                try:
-                    font = _PILIF.truetype(obj['font_name'], max(1, obj['font_size']))
-                except Exception:
-                    font = _PILIF.load_default()
+                font = _load_font(obj['font_name'], obj['font_size'])
                 c = obj['color']
                 draw.text((obj['x'], obj['y']), obj['text'],
-                           fill=(c.r, c.g, c.b, c.a), font=font)
-                # Draw selection box around active text
+                          fill=(c.r, c.g, c.b, c.a), font=font)
                 if i == self._active_text_idx:
                     tw, th = measure_text(obj['text'], obj['font_name'], obj['font_size'])
                     tw = max(tw, 20); th = max(th, obj['font_size'])
@@ -151,6 +158,12 @@ class CanvasWidget(QWidget):
                         [obj['x']-2, obj['y']-2, obj['x']+tw+2, obj['y']+th+2],
                         outline=(80, 160, 255, 200), width=1
                     )
+        # Draw floating selection pixels on top
+        if self._sel_float is not None:
+            from PIL import Image as _flI
+            fp = _flI.fromarray(self._sel_float, "RGBA")
+            flat.paste(fp, self._sel_float_pos, fp)
+
         self._composite_cache = _pil_to_pixmap(flat)
         self._cache_dirty = False
 
@@ -314,6 +327,15 @@ class CanvasWidget(QWidget):
             self._draw_transform_overlay(painter)
         else:
             self._draw_brush_cursor(painter)
+
+        # Selection marquee
+        if self._selection and self._tools.tool == ToolType.SELECT:
+            self._draw_selection_marquee(painter)
+
+        # Symmetry guide lines
+        sym = getattr(self._tools, 'symmetry_axis', None)
+        if sym and sym.value != 'none':
+            self._draw_symmetry_guides(painter)
 
         painter.end()
 
@@ -488,6 +510,7 @@ class CanvasWidget(QWidget):
     # ── Mouse events ──────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
+        self.setFocus()   # ensure canvas always has keyboard focus after any click
         wx, wy = event.pos().x(), event.pos().y()
 
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -542,6 +565,17 @@ class CanvasWidget(QWidget):
             flood_fill(layer.pixels, cx, cy, self._tools.primary_color, self._tools.fill_tolerance)
             self._invalidate_cache()
             self.canvas_changed.emit(self._canvas.flatten())
+            return
+
+        if tool == ToolType.SELECT:
+            # If floating selection exists, stamp it first
+            if self._sel_float is not None:
+                self._flatten_float()
+                self._canvas_changed_emit()
+            self._sel_start    = (cx, cy)
+            self._sel_dragging = True
+            self._selection    = None
+            self._invalidate_cache()
             return
 
         if tool in (ToolType.RECTANGLE, ToolType.ELLIPSE, ToolType.LINE):
@@ -662,6 +696,25 @@ class CanvasWidget(QWidget):
 
         # Text drag (must be before drawing check)
         tool = self._tools.tool
+
+        # Selection drag
+        if tool == ToolType.SELECT and self._sel_dragging and self._sel_start:
+            sx, sy = self._sel_start
+            x0, y0 = min(sx, cx), min(sy, cy)
+            x1, y1 = max(sx, cx), max(sy, cy)
+            w = max(1, x1 - x0); h = max(1, y1 - y0)
+            self._selection = (x0, y0, w, h)
+            self._invalidate_cache()
+            return
+
+        # Float drag — move cut/copied pixels
+        if tool == ToolType.SELECT and self._sel_float is not None and self._sel_moving:
+            if self._sel_move_start:
+                ox, oy = self._sel_move_off
+                self._sel_float_pos = (cx - ox, cy - oy)
+                self._invalidate_cache()
+            return
+
         if tool == ToolType.TEXT and self._text_dragging and self._active_text_idx >= 0:
             obj = self._text_objects[self._active_text_idx]
             obj['x'] = cx - self._text_drag_off[0]
@@ -775,6 +828,12 @@ class CanvasWidget(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
 
+        # Stop selection drag
+        if self._sel_dragging:
+            self._sel_dragging = False
+        if self._sel_moving:
+            self._sel_moving = False
+
         # Stop text drag
         if self._text_dragging:
             self._text_dragging = False
@@ -821,6 +880,42 @@ class CanvasWidget(QWidget):
 
         self._drawing = False; self._last_canvas_pos = None
 
+    def _draw_selection_marquee(self, p):
+        from PyQt6.QtCore import Qt as _Qt
+        if not self._selection:
+            return
+        ox, oy = self._canvas_origin()
+        x, y, w, h = self._selection
+        rx = int(ox + x * self._zoom)
+        ry = int(oy + y * self._zoom)
+        rw = int(w * self._zoom)
+        rh = int(h * self._zoom)
+        # Animated dashes via tick — just use a fixed dash for simplicity
+        pen = QPen(QColor(255, 255, 255, 220), 1, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawRect(rx, ry, rw, rh)
+        pen2 = QPen(QColor(0, 0, 0, 180), 1, Qt.PenStyle.DashLine)
+        pen2.setDashOffset(4)
+        p.setPen(pen2)
+        p.drawRect(rx, ry, rw, rh)
+
+    def _draw_symmetry_guides(self, p):
+        from core.models import SymmetryAxis as _SA
+        sym = getattr(self._tools, 'symmetry_axis', None)
+        if not sym or sym == _SA.NONE:
+            return
+        ox, oy = self._canvas_origin()
+        W = self._canvas.width  * self._zoom
+        H = self._canvas.height * self._zoom
+        pen = QPen(QColor(80, 200, 255, 120), 1, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        if sym in (_SA.HORIZONTAL, _SA.BOTH):
+            mx = int(ox + W / 2)
+            p.drawLine(mx, int(oy), mx, int(oy + H))
+        if sym in (_SA.VERTICAL, _SA.BOTH):
+            my = int(oy + H / 2)
+            p.drawLine(int(ox), my, int(ox + W), my)
+
     def mouseDoubleClickEvent(self, event):
         """Double-click a text object to edit it."""
         if self._tools.tool != ToolType.TEXT:
@@ -845,25 +940,53 @@ class CanvasWidget(QWidget):
                 self._invalidate_cache()
 
     def keyPressEvent(self, event):
-        """Delete key removes the selected text object."""
+        """Handle all keyboard shortcuts directly on the canvas widget."""
         from PyQt6.QtCore import Qt as _Qt
-        if (self._tools.tool == ToolType.TEXT
-                and event.key() == _Qt.Key.Key_Delete
-                and self._active_text_idx >= 0):
-            self._bake_text(self._active_text_idx)
-            del self._text_objects[self._active_text_idx]
-            self._active_text_idx = -1
-            self._invalidate_cache()
+        key  = event.key()
+        ctrl = event.modifiers() & _Qt.KeyboardModifier.ControlModifier
+        shift= event.modifiers() & _Qt.KeyboardModifier.ShiftModifier
+
+        # ── Text tool keys ────────────────────────────────────────────────────
+        if self._tools.tool == ToolType.TEXT and self._active_text_idx >= 0:
+            if key == _Qt.Key.Key_Delete:
+                self._bake_text(self._active_text_idx)
+                del self._text_objects[self._active_text_idx]
+                self._active_text_idx = -1
+                self._invalidate_cache()
+                return
+            if key in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter):
+                self._bake_text(self._active_text_idx)
+                del self._text_objects[self._active_text_idx]
+                self._active_text_idx = -1
+                self._invalidate_cache()
+                return
+
+        # ── Selection shortcuts (always active) ───────────────────────────────
+        if ctrl and key == _Qt.Key.Key_A:
+            self.select_all(); return
+        if ctrl and key == _Qt.Key.Key_D:
+            self.clear_selection(); return
+        if ctrl and key == _Qt.Key.Key_C:
+            self.copy_selection(); return
+        if ctrl and key == _Qt.Key.Key_X:
+            self.cut_selection(); return
+        if ctrl and key == _Qt.Key.Key_V:
+            self.paste_selection(); return
+        if key == _Qt.Key.Key_Escape:
+            if self._sel_float is not None:
+                self.paste_selection()   # drop float on Escape
+            else:
+                self.clear_selection()
             return
-        # Also: Enter/Return while text selected = bake it
-        if (self._tools.tool == ToolType.TEXT
-                and event.key() in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter)
-                and self._active_text_idx >= 0):
-            self._bake_text(self._active_text_idx)
-            del self._text_objects[self._active_text_idx]
-            self._active_text_idx = -1
-            self._invalidate_cache()
-            return
+        if key == _Qt.Key.Key_Delete and self._tools.tool == ToolType.SELECT:
+            self.delete_selection(); return
+
+        # ── Undo / Redo ───────────────────────────────────────────────────────
+        if ctrl and key == _Qt.Key.Key_Z:
+            self.undo(); return
+        if ctrl and (key == _Qt.Key.Key_Y or (shift and key == _Qt.Key.Key_Z)):
+            self.redo(); return
+
         super().keyPressEvent(event)
 
     def leaveEvent(self, event):
@@ -935,20 +1058,38 @@ class CanvasWidget(QWidget):
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    def _track_recent_color(self, color):
+        """Add color to recent list (max 16, no duplicates)."""
+        rc = self._tools.recent_colors
+        key = (color.r, color.g, color.b, color.a)
+        # Remove if already present
+        self._tools.recent_colors = [c for c in rc
+                                     if (c.r, c.g, c.b, c.a) != key]
+        self._tools.recent_colors.insert(0, color)
+        self._tools.recent_colors = self._tools.recent_colors[:16]
+        self.recent_colors_changed.emit()
+
+    def _canvas_changed_emit(self):
+        self._invalidate_cache()
+        self.canvas_changed.emit(self._canvas.flatten())
+
     def sync_text_settings(self):
-        """Called whenever tool settings change — update the selected text object.
-        Uses _last_text_idx as fallback so font size changes work even after
-        the selection is cleared (e.g. after closing the text dialog)."""
+        """Called whenever tool settings change — update the selected text object."""
         idx = self._active_text_idx
         if idx < 0:
             idx = self._last_text_idx
         if idx < 0 or idx >= len(self._text_objects):
             return
         obj = self._text_objects[idx]
+        changed = (obj['font_name'] != self._tools.font_name or
+                   obj['font_size'] != self._tools.font_size or
+                   obj['color']     != self._tools.primary_color)
         obj['font_name'] = self._tools.font_name
         obj['font_size'] = self._tools.font_size
         obj['color']     = self._tools.primary_color
-        self._invalidate_cache()
+        if changed:
+            self._cache_dirty = True
+            self.update()
 
     def _text_hit(self, cx, cy):
         """Return index of text object under canvas point (cx,cy), or -1."""
@@ -974,23 +1115,153 @@ class CanvasWidget(QWidget):
                           obj['color'], obj['font_name'], obj['font_size'])
                 self.canvas_changed.emit(self._canvas.flatten())
 
+    # ── Selection helpers ─────────────────────────────────────────────────────
+
+    def get_selection_rect(self) -> Optional[Tuple[int,int,int,int]]:
+        """Return (x, y, w, h) of current selection, or None for full canvas."""
+        return self._selection
+
+    def clear_selection(self):
+        """Deselect / drop floating selection."""
+        if self._sel_float is not None:
+            self._flatten_float()
+        self._selection    = None
+        self._sel_dragging = False
+        self._sel_float    = None
+        self._invalidate_cache()
+
+    def _flatten_float(self):
+        """Stamp the floating pixels back into the active layer."""
+        if self._sel_float is None:
+            return
+        layer = self._canvas.active_layer
+        if layer is None:
+            return
+        fx, fy = self._sel_float_pos
+        fh, fw = self._sel_float.shape[:2]
+        h, w   = layer.pixels.shape[:2]
+        x0, y0 = max(0, fx), max(0, fy)
+        x1, y1 = min(w, fx+fw), min(h, fy+fh)
+        if x1 > x0 and y1 > y0:
+            sx0, sy0 = x0-fx, y0-fy
+            from core.paint_engine import _composite as _comp
+            patch = self._sel_float[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+            dest  = layer.pixels[y0:y1, x0:x1]
+            # alpha-composite float over dest
+            fa  = patch[...,3:].astype(np.float32)/255
+            da  = dest[...,3:].astype(np.float32)/255
+            oa  = fa + da*(1-fa)
+            safe= np.where(oa>0, oa, 1.0)
+            for i in range(3):
+                dest[...,i] = np.clip(
+                    (patch[...,i].astype(np.float32)*fa[...,0] +
+                     dest[...,i].astype(np.float32)*da[...,0]*(1-fa[...,0])) / safe[...,0],
+                    0, 255)
+            dest[...,3] = np.clip(oa[...,0]*255, 0, 255)
+            layer.pixels[y0:y1, x0:x1] = dest
+        self._sel_float = None
+
+    def copy_selection(self):
+        """Copy selected region to clipboard (internal)."""
+        layer = self._canvas.active_layer
+        if layer is None:
+            return
+        if self._selection is None:
+            self._sel_float     = layer.pixels.copy()
+            self._sel_float_pos = (0, 0)
+        else:
+            x, y, w, h = self._selection
+            self._sel_float     = layer.pixels[y:y+h, x:x+w].copy()
+            self._sel_float_pos = (x, y)
+
+    def cut_selection(self):
+        """Cut selected region — lifts pixels into a floating layer."""
+        layer = self._canvas.active_layer
+        if layer is None:
+            return
+        self._push_history()
+        self.copy_selection()
+        if self._selection:
+            x, y, w, h = self._selection
+            layer.pixels[y:y+h, x:x+w] = 0   # erase source
+        else:
+            layer.pixels[:] = 0
+        self._invalidate_cache()
+        self.canvas_changed.emit(self._canvas.flatten())
+
+    def paste_selection(self):
+        """Paste the floating clipboard at current position."""
+        if self._sel_float is None:
+            return
+        self._push_history()
+        self._flatten_float()
+        self._selection = None
+        self._invalidate_cache()
+        self.canvas_changed.emit(self._canvas.flatten())
+
+    def delete_selection(self):
+        """Delete (clear) the selected region."""
+        layer = self._canvas.active_layer
+        if layer is None:
+            return
+        self._push_history()
+        if self._selection:
+            x, y, w, h = self._selection
+            layer.pixels[y:y+h, x:x+w, 3] = 0
+        else:
+            layer.pixels[..., 3] = 0
+        self._invalidate_cache()
+        self.canvas_changed.emit(self._canvas.flatten())
+
+    def select_all(self):
+        """Select entire canvas."""
+        if self._sel_float is not None:
+            self._flatten_float()
+        self._selection = (0, 0, self._canvas.width, self._canvas.height)
+        self._invalidate_cache()
+
     def _apply_brush(self, cx: int, cy: int):
         layer = self._canvas.active_layer
         if layer is None:
             return
-        tool = self._tools.tool
-        bt = getattr(self._tools, 'brush_type', None)
-        prev = self._last_canvas_pos
+        tool  = self._tools.tool
+        bt    = getattr(self._tools, 'brush_type', None)
+        prev  = self._last_canvas_pos
         px, py = (prev[0], prev[1]) if prev else (cx, cy)
-        if tool == ToolType.BRUSH:
-            paint_brush_stroke(layer.pixels, cx, cy, self._tools.primary_color,
-                               self._tools.brush_size, self._tools.brush_hardness,
-                               self._tools.brush_opacity, bt, px, py,
-                               stroke_seed=cx ^ cy)
-        elif tool == ToolType.ERASER:
-            erase_brush_stroke(layer.pixels, cx, cy, self._tools.brush_size,
-                               self._tools.brush_hardness, self._tools.brush_opacity)
+
+        # Collect all (x, y, prev_x, prev_y) dab positions for symmetry
+        W, H = self._canvas.width, self._canvas.height
+        cx_m = W - 1 - cx;  px_m = W - 1 - px   # h-mirror
+        cy_m = H - 1 - cy;  py_m = H - 1 - py   # v-mirror
+        sym = getattr(self._tools, 'symmetry_axis', None)
+        if sym is None:
+            from core.models import SymmetryAxis as _SA
+            sym = _SA.NONE
+        from core.models import SymmetryAxis as _SA
+
+        # Track this color as recently used
+        self._track_recent_color(self._tools.primary_color)
+
+        dabs = [(cx, cy, px, py)]
+        if sym in (_SA.HORIZONTAL, _SA.BOTH):
+            dabs.append((cx_m, cy, px_m, py))
+        if sym in (_SA.VERTICAL, _SA.BOTH):
+            dabs.append((cx, cy_m, px, py_m))
+        if sym == _SA.BOTH:
+            dabs.append((cx_m, cy_m, px_m, py_m))
+
+        for dx, dy, dpx, dpy in dabs:
+            if tool == ToolType.BRUSH:
+                paint_brush_stroke(layer.pixels, dx, dy, self._tools.primary_color,
+                                   self._tools.brush_size, self._tools.brush_hardness,
+                                   self._tools.brush_opacity, bt, dpx, dpy, dx ^ dy)
+            elif tool == ToolType.ERASER:
+                erase_brush_stroke(layer.pixels, dx, dy,
+                                   self._tools.brush_size, self._tools.brush_hardness,
+                                   self._tools.brush_opacity)
+
         self._invalidate_cache()
+
 
     def _make_preview_flat(self, preview_pixels, target_layer) -> PILImage.Image:
         result = PILImage.new("RGBA", (self._canvas.width, self._canvas.height), (0,0,0,0))

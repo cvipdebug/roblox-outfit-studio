@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QColorDialog, QGroupBox, QToolButton,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtGui import QColor, QIcon, QPixmap, QPainter, QPen
 from core.models import ToolSettings, ToolType, BrushType, Color
 
 # ─── Shared stylesheet fragments ──────────────────────────────────────────────
@@ -193,6 +193,41 @@ class ToolOptionsPanel(QWidget):
         row2.addWidget(self._hex); cl.addLayout(row2)
         root.addWidget(cg)
 
+        # ── Recent Colors ─────────────────────────────────────────────────────
+        rg, rl = _grp("RECENT")
+        self._recent_row = QHBoxLayout()
+        self._recent_row.setSpacing(2)
+        self._recent_chips = []
+        for _ in range(16):
+            chip = QToolButton()
+            chip.setFixedSize(14, 14)
+            chip.setStyleSheet("QToolButton{border:1px solid #333;border-radius:1px;padding:0;}")
+            chip.setVisible(False)
+            self._recent_row.addWidget(chip)
+            self._recent_chips.append(chip)
+        self._recent_row.addStretch()
+        rl.addLayout(self._recent_row)
+        root.addWidget(rg)
+        self._bg_recent = rg
+
+        # ── Palette ───────────────────────────────────────────────────────────
+        pg, pl = _grp("PALETTE")
+        self._palette_grid = QGridLayout()
+        self._palette_grid.setSpacing(2)
+        self._palette_btns = []
+        for i in range(16):
+            btn = QToolButton()
+            btn.setFixedSize(18, 18)
+            btn.setStyleSheet("QToolButton{border:1px solid #444;border-radius:2px;padding:0;}")
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda pos, idx=i: self._on_palette_rclick(idx))
+            self._palette_grid.addWidget(btn, i // 8, i % 8)
+            self._palette_btns.append(btn)
+        pl.addLayout(self._palette_grid)
+        root.addWidget(pg)
+        self._bg_palette = pg
+        self._refresh_palette()
+
         # ── Brush ─────────────────────────────────────────────────────────────
         self._bg_brush, bl = _grp("BRUSH")
         self._sz_sl, self._sz_sp = self._slide_row(bl, "Size", 1, 500, self._s.brush_size, self._on_sz)
@@ -247,23 +282,36 @@ class ToolOptionsPanel(QWidget):
 
         # ── Text ──────────────────────────────────────────────────────────────
         self._bg_text, tl = _grp("TEXT")
+
         fr = QHBoxLayout(); fr.setSpacing(6)
-        fr.addWidget(_lbl("Font:", 30))
+        fr.addWidget(_lbl("Font:", 36))
         self._font = QComboBox()
-        self._font.addItems(["Arial","Times New Roman","Courier New","Georgia","Verdana","Impact"])
-        self._font.setCurrentText(self._s.font_name); self._font.setFixedHeight(H)
-        self._font.setStyleSheet("QComboBox{color:#dde;background:#22223a;border:1px solid #454565;"
-            "border-radius:3px;padding:0 4px;font-size: 8pt;}"
+        self._font.addItems(["Arial","Times New Roman","Courier New",
+                             "Georgia","Verdana","Impact","Segoe UI","Calibri"])
+        self._font.setCurrentText(self._s.font_name)
+        self._font.setFixedHeight(H)
+        self._font.setStyleSheet(
+            "QComboBox{color:#dde;background:#22223a;border:1px solid #454565;"
+            "border-radius:3pt;padding:0 4pt;font-size:8pt;}"
             "QComboBox::drop-down{border-left:1px solid #454565;width:16px;}"
-            "QComboBox QAbstractItemView{background:#22223a;color:#dde;selection-background-color:#3a4a80;}")
+            "QComboBox QAbstractItemView{background:#22223a;color:#dde;"
+            "selection-background-color:#3a4a80;}")
         self._font.currentTextChanged.connect(self._on_font)
-        fr.addWidget(self._font, 1); tl.addLayout(fr)
+        fr.addWidget(self._font, 1)
+        tl.addLayout(fr)
 
         sr = QHBoxLayout(); sr.setSpacing(6)
-        sr.addWidget(_lbl("Size:", 30))
-        self._fsize = _spin(6, 200, self._s.font_size)
+        sr.addWidget(_lbl("Size:", 36))
+        self._fsize = QSpinBox()
+        self._fsize.setRange(6, 500)
+        self._fsize.setValue(self._s.font_size)
+        self._fsize.setFixedHeight(H)
+        self._fsize.setMinimumWidth(70)
+        self._fsize.setStyleSheet(_SPIN)
         self._fsize.valueChanged.connect(self._on_fsize)
-        sr.addWidget(self._fsize); sr.addStretch(); tl.addLayout(sr)
+        sr.addWidget(self._fsize)
+        sr.addStretch()
+        tl.addLayout(sr)
         root.addWidget(self._bg_text)
 
         # ── Shape options ─────────────────────────────────────────────────────
@@ -347,6 +395,22 @@ class ToolOptionsPanel(QWidget):
         gsr.addWidget(self._gspin); gsr.addStretch(); gl.addLayout(gsr)
         root.addWidget(gg)
 
+        # ── Symmetry ─────────────────────────────────────────────────────────
+        sg, syl = _grp("SYMMETRY")
+        sym_row = QHBoxLayout(); sym_row.setSpacing(4)
+        self._sym_btns = {}
+        for label, val in [("Off","none"),("H ↔","horizontal"),("V ↕","vertical"),("✛ Both","both")]:
+            b = QToolButton(); b.setText(label); b.setCheckable(True)
+            b.setFixedHeight(H)
+            b.setStyleSheet("QToolButton{background:#28283e;border:1px solid #454565;"
+                            "border-radius:3pt;font-size:8pt;color:#dde;}"
+                            "QToolButton:checked{background:#3a4a80;border-color:#89b4fa;}")
+            b.clicked.connect(lambda checked, v=val: self._on_sym(v))
+            sym_row.addWidget(b); self._sym_btns[val] = b
+        self._sym_btns["none"].setChecked(True)
+        syl.addLayout(sym_row)
+        root.addWidget(sg)
+
         root.addStretch()
 
     # ── Row builders ──────────────────────────────────────────────────────────
@@ -380,14 +444,15 @@ class ToolOptionsPanel(QWidget):
         self._bg_tx.setVisible(tool == ToolType.TRANSFORM)
 
     def set_text_font(self, font_name: str, font_size: int):
-        """Update font controls to reflect the selected text object."""
+        """Update font panel when a text object is selected."""
         self._s.font_name = font_name
         self._s.font_size = font_size
         self._font.blockSignals(True)
         self._fsize.blockSignals(True)
-        if self._font.findText(font_name) >= 0:
-            self._font.setCurrentText(font_name)
-        self._fsize.setValue(max(6, min(200, font_size)))
+        idx = self._font.findText(font_name)
+        if idx >= 0:
+            self._font.setCurrentIndex(idx)
+        self._fsize.setValue(max(6, min(500, font_size)))
         self._font.blockSignals(False)
         self._fsize.blockSignals(False)
 
@@ -422,11 +487,9 @@ class ToolOptionsPanel(QWidget):
     def _on_op(self, v):  self._s.brush_opacity  = v/100;   self.tool_settings_changed.emit()
     def _on_tol(self, v): self._s.fill_tolerance = v;        self.tool_settings_changed.emit()
     def _on_font(self, n):
-        if self._upd: return
         self._s.font_name = n
         self.tool_settings_changed.emit()
     def _on_fsize(self, v):
-        if self._upd: return
         self._s.font_size = v
         self.tool_settings_changed.emit()
     def _on_snap(self, v): self._s.snap_to_grid = v;         self.tool_settings_changed.emit()
@@ -440,6 +503,68 @@ class ToolOptionsPanel(QWidget):
         self._s.shape_line_width = v
         self.tool_settings_changed.emit()
     def _on_gsize(self, v): self._s.grid_size = v;           self.tool_settings_changed.emit()
+
+    # ── Palette / Recent ──────────────────────────────────────────────────────
+
+    def _refresh_palette(self):
+        for i, btn in enumerate(self._palette_btns):
+            if i < len(self._s.palette_colors):
+                c = self._s.palette_colors[i]
+                pix = QPixmap(14, 14)
+                pix.fill(QColor(c.r, c.g, c.b, c.a))
+                btn.setIcon(QIcon(pix)); btn.setIconSize(pix.size())
+                btn.setToolTip(f"#{c.r:02x}{c.g:02x}{c.b:02x}")
+                btn.clicked.disconnect() if btn.receivers(btn.clicked) else None
+                btn.clicked.connect(lambda _, idx=i: self._on_palette_click(idx))
+                btn.setVisible(True)
+
+    def _on_palette_click(self, idx: int):
+        if idx < len(self._s.palette_colors):
+            c = self._s.palette_colors[idx]
+            self._s.primary_color = c
+            self._fg.color = c
+            self._hex.setText(c.to_hex())
+            self.tool_settings_changed.emit()
+
+    def _on_palette_rclick(self, idx: int):
+        """Right-click palette swatch = set to current color."""
+        c = self._s.primary_color
+        if idx < len(self._s.palette_colors):
+            self._s.palette_colors[idx] = c
+        else:
+            self._s.palette_colors.append(c)
+        self._refresh_palette()
+
+    def refresh_recent_colors(self):
+        """Called by main window when recent_colors list changes."""
+        for i, chip in enumerate(self._recent_chips):
+            if i < len(self._s.recent_colors):
+                c = self._s.recent_colors[i]
+                pix = QPixmap(10, 10); pix.fill(QColor(c.r, c.g, c.b))
+                chip.setIcon(QIcon(pix)); chip.setIconSize(pix.size())
+                chip.setToolTip(f"#{c.r:02x}{c.g:02x}{c.b:02x}")
+                chip.setVisible(True)
+                chip.clicked.disconnect() if chip.receivers(chip.clicked) else None
+                chip.clicked.connect(lambda _, idx=i: self._on_recent_click(idx))
+            else:
+                chip.setVisible(False)
+
+    def _on_recent_click(self, idx: int):
+        if idx < len(self._s.recent_colors):
+            c = self._s.recent_colors[idx]
+            self._s.primary_color = c
+            self._fg.color = c
+            self._hex.setText(c.to_hex())
+            self.tool_settings_changed.emit()
+
+    def _on_sym(self, val):
+        from core.models import SymmetryAxis as _SA
+        axis_map = {"none": _SA.NONE, "horizontal": _SA.HORIZONTAL,
+                    "vertical": _SA.VERTICAL, "both": _SA.BOTH}
+        self._s.symmetry_axis = axis_map.get(val, _SA.NONE)
+        for k, b in self._sym_btns.items():
+            b.setChecked(k == val)
+        self.tool_settings_changed.emit()
 
     def _rot_by(self, d):
         if not self._upd:
