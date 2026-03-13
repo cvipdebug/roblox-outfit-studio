@@ -1,13 +1,18 @@
 """
-viewer/gl_widget.py - Roblox R6 avatar viewer (PyQt6 + OpenGL).
+viewer/gl_widget.py — Roblox R6 avatar 3D preview (PyQt6 + OpenGL).
 
-Correct per-face UV mapping from the official 585x559 shirt template.
-Solid opaque fallback when no texture loaded (never transparent).
-Exact R6 stud dimensions matching StudioR6.rbxm.
+Clean rewrite. Key design decisions:
+  - draw_part() draws ALL 6 faces unconditionally — textured if a tex region exists,
+    solid skin colour if not. Never leaves a face invisible.
+  - UV coords use a simple, consistent winding: every face maps its pixel rect with
+    bottom-left origin in GL UV space.
+  - Texture upload flips top-bottom once (PIL top-left → GL bottom-left).
+  - SHIRT_FACES / PANTS_FACES contain only the faces that actually have texture
+    content; unlisted faces fall back to skin colour automatically.
 """
 from __future__ import annotations
 import math
-from typing import Optional, Tuple
+from typing import Optional
 import numpy as np
 from PIL import Image
 from PyQt6.QtWidgets import QSizePolicy
@@ -30,7 +35,8 @@ try:
         GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST,
         GL_LIGHTING, GL_LIGHT0, GL_COLOR_MATERIAL, GL_SMOOTH,
         GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE,
-        GL_AMBIENT, GL_DIFFUSE, GL_QUADS, GL_LINES, GL_TRIANGLES, GL_TRIANGLE_FAN, GL_TEXTURE_2D,
+        GL_AMBIENT, GL_DIFFUSE, GL_QUADS, GL_LINES,
+        GL_TRIANGLES, GL_TEXTURE_2D,
         GL_LINEAR, GL_CLAMP_TO_EDGE, GL_RGBA, GL_UNSIGNED_BYTE,
         GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
         GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
@@ -42,56 +48,59 @@ try:
 except ImportError:
     OPENGL_AVAILABLE = False
 
-# Template dimensions
+# ── Template dimensions ───────────────────────────────────────────────────────
 TW, TH = 585.0, 559.0
 
-# ---------------------------------------------------------------------------
-# Shirt template face pixel regions (verified pixel-by-pixel from template PNG)
-# ---------------------------------------------------------------------------
+# ── Skin / dark colours ───────────────────────────────────────────────────────
+SKIN = (0.91, 0.73, 0.60)
+DARK = (0.20, 0.14, 0.10)
+
+# ── Official Roblox 585×559 shirt template UV regions ────────────────────────
+#
+# Torso cross-layout (verified from roblox_shirt_template.png):
+#   UP    (231,  8)–(359, 72)   128×64
+#   FRONT (231, 74)–(359,202)   128×128
+#   R     (165, 74)–(229,202)    64×128  ← character's RIGHT
+#   L     (361, 74)–(425,202)    64×128  ← character's LEFT
+#   BACK  (427, 74)–(555,202)   128×128
+#   DOWN  (231,204)–(359,268)   128×64
+#
+# Arm block (right arm shown; left arm mirrors starting at x=308):
+#   L col (gold,  outer)   x= 19– 82  ← face normal (-1,0,0) = "right" in box
+#   B col (dkblue,back)    x= 85–148  ← face normal ( 0,0,-1) = "back"
+#   R col (green, inner)   x=151–214  ← face normal (+1,0,0) = "left" in box
+#   F col (red,   front)   x=217–280  ← face normal ( 0,0,+1) = "front"
+#   U     above F col      y=289–352
+#   D     below F col      y=485–549
+#
 SHIRT_FACES = {
     "torso": {
-        "top":    (231,   8, 359,  72),   # UP
-        "front":  (231,  74, 359, 202),   # FRONT
-        "right":  (165,  74, 229, 202),   # R (character right)
-        "left":   (361,  74, 425, 202),   # L (character left)
-        "back":   (427,  74, 555, 202),   # BACK
-        "bottom": (231, 204, 359, 268),   # DOWN
+        "top":    (231,   8, 359,  72),
+        "front":  (231,  74, 359, 202),
+        "right":  (165,  74, 229, 202),   # character RIGHT
+        "left":   (361,  74, 425, 202),   # character LEFT
+        "back":   (427,  74, 555, 202),
+        "bottom": (231, 204, 359, 268),
     },
     "right_arm": {
-        "top":    ( 19, 355,  83, 407),
-        "left":   ( 19, 408,  83, 483),
-        "back":   ( 85, 408, 149, 483),
-        "right":  (151, 408, 215, 483),
-        "front":  (217, 408, 281, 483),
-        "bottom": (217, 485, 281, 549),
+        "top":    (217, 289, 280, 352),
+        "front":  (217, 355, 280, 483),   # F — faces viewer
+        "back":   ( 85, 355, 148, 483),   # B — faces away
+        "right":  ( 19, 355,  82, 483),   # outer side
+        "left":   (151, 355, 214, 483),   # inner side (toward torso)
+        "bottom": (217, 485, 280, 549),
     },
     "left_arm": {
-        "top":    (374, 355, 438, 407),
-        "front":  (308, 408, 372, 483),
-        "left":   (374, 408, 438, 483),
-        "back":   (440, 408, 504, 483),
-        "right":  (506, 408, 570, 483),
-        "bottom": (308, 485, 372, 549),
+        "top":    (308, 289, 371, 352),
+        "front":  (308, 355, 371, 483),   # F — faces viewer
+        "back":   (440, 355, 503, 483),   # B — faces away
+        "right":  (374, 355, 437, 483),   # inner side (toward torso)
+        "left":   (506, 355, 569, 483),   # outer side
+        "bottom": (308, 485, 371, 549),
     },
 }
 
 PANTS_FACES = {
-    "right_leg": {
-        "top":    ( 19, 355,  83, 407),
-        "left":   ( 19, 408,  83, 483),
-        "back":   ( 85, 408, 149, 483),
-        "right":  (151, 408, 215, 483),
-        "front":  (217, 408, 281, 483),
-        "bottom": (217, 485, 281, 549),
-    },
-    "left_leg": {
-        "top":    (374, 355, 438, 407),
-        "front":  (308, 408, 372, 483),
-        "left":   (374, 408, 438, 483),
-        "back":   (440, 408, 504, 483),
-        "right":  (506, 408, 570, 483),
-        "bottom": (308, 485, 372, 549),
-    },
     "torso": {
         "top":    (231,   8, 359,  72),
         "front":  (231,  74, 359, 202),
@@ -100,123 +109,150 @@ PANTS_FACES = {
         "back":   (427,  74, 555, 202),
         "bottom": (231, 204, 359, 268),
     },
+    "right_leg": {
+        "top":    (217, 289, 280, 352),
+        "front":  (217, 355, 280, 483),
+        "back":   ( 85, 355, 148, 483),
+        "right":  ( 19, 355,  82, 483),
+        "left":   (151, 355, 214, 483),
+        "bottom": (217, 485, 280, 549),
+    },
+    "left_leg": {
+        "top":    (308, 289, 371, 352),
+        "front":  (308, 355, 371, 483),
+        "back":   (440, 355, 503, 483),
+        "right":  (374, 355, 437, 483),
+        "left":   (506, 355, 569, 483),
+        "bottom": (308, 485, 371, 549),
+    },
 }
 
-# ---------------------------------------------------------------------------
-# Exact Roblox R6 part geometry in studs
-#
-# All parts touch seamlessly:
-#   Legs:  center=(±0.5, 1.0, 0)  half=(0.5, 1.0, 0.5) → Y: 0.0 to 2.0
-#   Torso: center=(0.0,  3.0, 0)  half=(1.0, 1.0, 0.5) → Y: 2.0 to 4.0
-#   Arms:  center=(±1.5, 3.0, 0)  half=(0.5, 1.0, 0.5) → Y: 2.0 to 4.0 (same as torso)
-#   Head:  center=(0.0,  4.5, 0)  half=(0.5, 0.5, 0.5) → Y: 4.0 to 5.0
-#
-# Total character height = 5 studs (ground to top of head)
-# ---------------------------------------------------------------------------
-SKIN  = (0.91, 0.73, 0.60)   # Roblox classic yellow skin
-DARK  = (0.30, 0.22, 0.16)   # eye / hair dark
-
+# ── R6 part geometry (studs) ─────────────────────────────────────────────────
+#   Legs:  y = 0–2   Arms/Torso: y = 2–4   Head: y = 4–5
 R6_PARTS = {
-    #             center (x,   y,    z)   half-extents (w,   h,   d)
-    "head":      (( 0.0,  4.5,  0.0),    (0.5,  0.5,  0.5)),
-    "torso":     (( 0.0,  3.0,  0.0),    (1.0,  1.0,  0.5)),
-    "right_arm": ((-1.5,  3.0,  0.0),    (0.5,  1.0,  0.5)),
-    "left_arm":  (( 1.5,  3.0,  0.0),    (0.5,  1.0,  0.5)),
-    "right_leg": ((-0.5,  1.0,  0.0),    (0.5,  1.0,  0.5)),
-    "left_leg":  (( 0.5,  1.0,  0.0),    (0.5,  1.0,  0.5)),
+    "head":      (( 0.0, 4.5, 0.0), (0.5, 0.5, 0.5)),
+    "torso":     (( 0.0, 3.0, 0.0), (1.0, 1.0, 0.5)),
+    "right_arm": ((-1.5, 3.0, 0.0), (0.5, 1.0, 0.5)),
+    "left_arm":  (( 1.5, 3.0, 0.0), (0.5, 1.0, 0.5)),
+    "right_leg": ((-0.5, 1.0, 0.0), (0.5, 1.0, 0.5)),
+    "left_leg":  (( 0.5, 1.0, 0.0), (0.5, 1.0, 0.5)),
 }
 
-def _box_faces(x0, y0, z0, x1, y1, z1):
-    """Return 6 faces as (name, normal, [4 verts CCW from outside])."""
+# ── UV helpers ────────────────────────────────────────────────────────────────
+
+def _uv(px0, py0, px1, py1, face_name: str):
+    """
+    Convert a pixel rect (top-left origin) to 4 UV pairs for a quad.
+
+    GL textures are stored bottom-row-first (after our FLIP_TOP_BOTTOM upload),
+    so v=0 is the BOTTOM of the image and v=1 is the TOP.
+    We therefore flip: v = 1 - py/TH.
+
+    Vertex winding from _box_verts:
+      side faces:   BL, BR, TR, TL  (CCW from outside)
+      top face:     back-L, front-L, front-R, back-R
+      bottom face:  front-L, back-L, back-R, front-R
+    """
+    u0 = px0 / TW;  u1 = px1 / TW
+    v0 = 1.0 - py1 / TH   # py1 is bottom of pixel rect → v0 (GL bottom)
+    v1 = 1.0 - py0 / TH   # py0 is top of pixel rect    → v1 (GL top)
+
+    if face_name == "top":
+        # back-L → front-L → front-R → back-R
+        # map: left→u0, right→u1, back→v1(top), front→v0(bot)
+        return [(u0, v1), (u0, v0), (u1, v0), (u1, v1)]
+    elif face_name == "bottom":
+        # front-L → back-L → back-R → front-R
+        # map: left→u0, right→u1, front→v0(bot), back→v1(top)
+        return [(u0, v0), (u0, v1), (u1, v1), (u1, v0)]
+    else:
+        # BL, BR, TR, TL
+        return [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+
+
+def _box_verts(x0, y0, z0, x1, y1, z1):
+    """
+    Return list of (face_name, normal_xyz, [4 verts]) for a box.
+    All faces wound CCW when viewed from outside (correct for back-face culling).
+    """
     return [
-        ("front",  ( 0,  0,  1), [(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]),
-        ("back",   ( 0,  0, -1), [(x1,y0,z0),(x0,y0,z0),(x0,y1,z0),(x1,y1,z0)]),
-        ("right",  (-1,  0,  0), [(x0,y0,z0),(x0,y0,z1),(x0,y1,z1),(x0,y1,z0)]),
-        ("left",   ( 1,  0,  0), [(x1,y0,z1),(x1,y0,z0),(x1,y1,z0),(x1,y1,z1)]),
-        ("top",    ( 0,  1,  0), [(x0,y1,z0),(x0,y1,z1),(x1,y1,z1),(x1,y1,z0)]),
-        ("bottom", ( 0, -1,  0), [(x0,y0,z1),(x0,y0,z0),(x1,y0,z0),(x1,y0,z1)]),
+        # name      normal         verts (CCW from outside)
+        ("front",  (0, 0, 1),  [(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]),  # BL BR TR TL
+        ("back",   (0, 0,-1),  [(x1,y0,z0),(x0,y0,z0),(x0,y1,z0),(x1,y1,z0)]),  # BL BR TR TL
+        ("right",  (-1,0, 0),  [(x0,y0,z0),(x0,y0,z1),(x0,y1,z1),(x0,y1,z0)]),  # BL BR TR TL
+        ("left",   ( 1,0, 0),  [(x1,y0,z1),(x1,y0,z0),(x1,y1,z0),(x1,y1,z1)]),  # BL BR TR TL
+        ("top",    (0, 1, 0),  [(x0,y1,z0),(x0,y1,z1),(x1,y1,z1),(x1,y1,z0)]),  # bL fL fR bR
+        ("bottom", (0,-1, 0),  [(x0,y0,z1),(x0,y0,z0),(x1,y0,z0),(x1,y0,z1)]),  # fL bL bR fR
     ]
 
-def _px_to_uv(x0, y0, x1, y1, face="side"):
-    """
-    Pixel rect (top-left origin) -> 4 UV corners matched to each face vertex winding.
-    Side faces wind BL,BR,TR,TL. Top winds TL,BL,BR,TR. Bottom winds BL,TL,TR,BR.
-    """
-    u0, u1 = x0 / TW, x1 / TW
-    v_bot  = 1.0 - y1 / TH
-    v_top  = 1.0 - y0 / TH
-    if face == "top":
-        return [(u0,v_top), (u0,v_bot), (u1,v_bot), (u1,v_top)]
-    elif face == "bottom":
-        return [(u0,v_bot), (u0,v_top), (u1,v_top), (u1,v_bot)]
-    else:
-        return [(u0,v_bot), (u1,v_bot), (u1,v_top), (u0,v_top)]
 
 def draw_part(cx, cy, cz, hw, hh, hd,
               shirt_faces, pants_faces,
               shirt_tex, pants_tex,
-              default_color=SKIN):
+              skin_color=SKIN):
     """
-    Draw a box body part.
-    - If a texture is loaded, UV-maps the correct region of it onto each face.
-    - If NO texture is loaded, draws each face as a solid opaque colour.
-    - All GL state set BEFORE glBegin (avoids GLError 1282).
+    Draw one box body part with per-face texture mapping.
+    Every face is drawn. Textured faces use the shirt or pants texture.
+    Faces with no texture entry draw as solid skin_color.
     """
     if not OPENGL_AVAILABLE:
         return
+
     x0, x1 = cx - hw, cx + hw
     y0, y1 = cy - hh, cy + hh
     z0, z1 = cz - hd, cz + hd
 
-    for face_name, normal, verts in _box_faces(x0, y0, z0, x1, y1, z1):
-        # Decide texture for this face
+    for fname, normal, verts in _box_verts(x0, y0, z0, x1, y1, z1):
+        # Find texture for this face
         px_rect = None
         tex_id  = 0
-        if shirt_faces and shirt_tex and face_name in shirt_faces:
-            px_rect = shirt_faces[face_name]
-            tex_id  = shirt_tex
-        elif pants_faces and pants_tex and face_name in pants_faces:
-            px_rect = pants_faces[face_name]
-            tex_id  = pants_tex
 
-        # ── Set state BEFORE glBegin ──────────────────────────────────────
+        if shirt_faces and shirt_tex:
+            rect = shirt_faces.get(fname)
+            if rect:
+                px_rect = rect
+                tex_id  = shirt_tex
+
+        if (not px_rect) and pants_faces and pants_tex:
+            rect = pants_faces.get(fname)
+            if rect:
+                px_rect = rect
+                tex_id  = pants_tex
+
+        # Draw face — textured if we have a valid rect+tex, skin fallback otherwise
         if px_rect and tex_id:
             glEnable(GL_TEXTURE_2D)
             glBindTexture(GL_TEXTURE_2D, tex_id)
-            glColor3f(1.0, 1.0, 1.0)   # white = show texture as-is
-            uvs = _px_to_uv(*px_rect, face=face_name)
-        else:
-            # No texture → solid opaque fallback colour, never transparent
-            glDisable(GL_TEXTURE_2D)
-            glColor3f(*default_color)
-            uvs = None
-
-        glBegin(GL_QUADS)
-        glNormal3f(*normal)
-        if uvs:
+            glColor4f(1.0, 1.0, 1.0, 1.0)
+            uvs = _uv(*px_rect, fname)
+            glBegin(GL_QUADS)
+            glNormal3f(*normal)
             for (u, v), vert in zip(uvs, verts):
                 glTexCoord2f(u, v)
                 glVertex3f(*vert)
+            glEnd()
         else:
+            glDisable(GL_TEXTURE_2D)
+            glColor3f(*skin_color)
+            glBegin(GL_QUADS)
+            glNormal3f(*normal)
             for vert in verts:
                 glVertex3f(*vert)
-        glEnd()
+            glEnd()
 
     glDisable(GL_TEXTURE_2D)
 
 
-# ---------------------------------------------------------------------------
-# Camera
-# ---------------------------------------------------------------------------
+# ── Camera ────────────────────────────────────────────────────────────────────
+
 class Camera:
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.azimuth   = 25.0
-        self.elevation = 18.0
+        self.azimuth   = 0.0
+        self.elevation = 12.0
         self.distance  = 9.0
-        # Target = centre of avatar (height 0..5, midpoint 2.5)
         self.target    = [0.0, 2.5, 0.0]
         self.fov       = 38.0
 
@@ -251,16 +287,12 @@ class Camera:
                   0.0, 1.0, 0.0)
 
 
-# ---------------------------------------------------------------------------
-# Main widget
-# ---------------------------------------------------------------------------
+# ── Main widget ───────────────────────────────────────────────────────────────
+
 class AvatarViewerWidget(QOpenGLWidget):
     """
     3D Roblox R6 avatar viewer.
-      Left-drag        = orbit
-      Right/Middle-drag = pan
-      Scroll wheel     = zoom
-      Double-click     = reset camera
+    Left-drag = orbit · Right/Middle-drag = pan · Scroll = zoom · Dbl-click = reset
     """
 
     def __init__(self, parent=None):
@@ -298,7 +330,6 @@ class AvatarViewerWidget(QOpenGLWidget):
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         glShadeModel(GL_SMOOTH)
-        # Blend enabled but avatar parts are fully opaque
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         self._apply_lighting()
@@ -340,14 +371,11 @@ class AvatarViewerWidget(QOpenGLWidget):
         self.update()
 
     def clear_textures(self):
-        """Remove all textures – avatar shows solid skin colour."""
         self.makeCurrent()
-        if self._shirt_tex_id:
-            try: glDeleteTextures([self._shirt_tex_id])
-            except: pass
-        if self._pants_tex_id:
-            try: glDeleteTextures([self._pants_tex_id])
-            except: pass
+        for tid in (self._shirt_tex_id, self._pants_tex_id):
+            if tid:
+                try: glDeleteTextures([tid])
+                except: pass
         self._shirt_tex_id = 0
         self._pants_tex_id = 0
         self.update()
@@ -369,12 +397,13 @@ class AvatarViewerWidget(QOpenGLWidget):
             self._camera.azimuth, self._camera.elevation = presets[preset]
             self.update()
 
-    def set_ambient(self, v: float):  self._ambient = v; self.update()
-    def set_diffuse(self, v: float):  self._diffuse = v; self.update()
-    def set_show_grid(self, s: bool): self._show_grid = s; self.update()
+    def set_ambient(self, v: float):   self._ambient = v;      self.update()
+    def set_diffuse(self, v: float):   self._diffuse = v;      self.update()
+    def set_show_grid(self, s: bool):  self._show_grid = s;    self.update()
 
     def set_skin_color(self, r: float, g: float, b: float):
-        self._skin_color = (r, g, b); self.update()
+        self._skin_color = (r, g, b)
+        self.update()
 
     def set_auto_rotate(self, enabled: bool):
         self._auto_rotate = enabled
@@ -386,10 +415,9 @@ class AvatarViewerWidget(QOpenGLWidget):
     def mousePressEvent(self, event: QMouseEvent):
         self._last_mouse   = event.pos()
         self._mouse_button = event.button()
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        else:
-            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor
+                       if event.button() == Qt.MouseButton.LeftButton
+                       else Qt.CursorShape.SizeAllCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._last_mouse is None:
@@ -399,7 +427,8 @@ class AvatarViewerWidget(QOpenGLWidget):
         self._last_mouse = event.pos()
         if self._mouse_button == Qt.MouseButton.LeftButton:
             self._camera.orbit(dx * 0.4, -dy * 0.4)
-        elif self._mouse_button in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+        elif self._mouse_button in (Qt.MouseButton.RightButton,
+                                    Qt.MouseButton.MiddleButton):
             self._camera.pan(dx, -dy)
         self.update()
 
@@ -413,12 +442,11 @@ class AvatarViewerWidget(QOpenGLWidget):
         self.update()
 
     def wheelEvent(self, event: QWheelEvent):
-        # Zoom: negative delta = zoom in (reduce distance)
         delta = event.angleDelta().y() / 120.0
         self._camera.zoom(-delta * self._camera.distance * 0.08)
         self.update()
 
-    # ── Private ───────────────────────────────────────────────────────────────
+    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _on_auto_rotate(self):
         self._camera.orbit(0.4, 0)
@@ -430,8 +458,9 @@ class AvatarViewerWidget(QOpenGLWidget):
         if old_id:
             try: glDeleteTextures([old_id])
             except: pass
+        # Convert to RGBA, flip vertically (PIL top-left → GL bottom-left)
         img  = img.convert("RGBA").transpose(Image.FLIP_TOP_BOTTOM)
-        data = np.array(img, dtype=np.uint8)
+        data = np.ascontiguousarray(np.array(img, dtype=np.uint8))
         h, w = data.shape[:2]
         tid  = int(glGenTextures(1))
         glBindTexture(GL_TEXTURE_2D, tid)
@@ -456,14 +485,12 @@ class AvatarViewerWidget(QOpenGLWidget):
         glDisable(GL_LIGHTING)
         glDisable(GL_TEXTURE_2D)
         glLineWidth(1.0)
-        # Minor grid
         glColor4f(0.22, 0.22, 0.32, 0.5)
         glBegin(GL_LINES)
         for i in range(-8, 9):
             glVertex3f(float(i), 0.0, -8.0); glVertex3f(float(i), 0.0,  8.0)
             glVertex3f(-8.0, 0.0, float(i)); glVertex3f( 8.0, 0.0, float(i))
         glEnd()
-        # Bold centre lines
         glLineWidth(1.5)
         glColor4f(0.35, 0.35, 0.50, 0.8)
         glBegin(GL_LINES)
@@ -476,83 +503,63 @@ class AvatarViewerWidget(QOpenGLWidget):
     def _draw_avatar(self):
         s = self._shirt_tex_id
         p = self._pants_tex_id
+        sk = self._skin_color
+
         for part, (center, half) in R6_PARTS.items():
             cx, cy, cz = center
             hw, hh, hd = half
+
             if part == "head":
-                self._draw_roblox_head(cx, cy, cz, hw, hh, hd)
+                self._draw_head(cx, cy, cz, hw, hh, hd)
             elif part == "torso":
                 draw_part(cx, cy, cz, hw, hh, hd,
                           SHIRT_FACES.get("torso"),
-                          PANTS_FACES.get("torso"), s, p, SKIN)
+                          PANTS_FACES.get("torso"), s, p, sk)
             else:
                 draw_part(cx, cy, cz, hw, hh, hd,
                           SHIRT_FACES.get(part),
-                          PANTS_FACES.get(part), s, p, SKIN)
+                          PANTS_FACES.get(part), s, p, sk)
 
-    def _draw_roblox_head(self, cx, cy, cz, hw, hh, hd):
-        """
-        Roblox R6 head rendered as a superellipsoid (smooth rounded box).
-        Uses parametric superellipse: |x/a|^n + |y/b|^n + |z/c|^n = 1, n=4.
-        This gives a box-like shape with fully rounded edges and corners on
-        ALL sides, matching the classic Roblox head appearance.
-        """
+    def _draw_head(self, cx, cy, cz, hw, hh, hd):
+        """Superellipsoid head (n=4 gives the classic rounded-box Roblox shape)."""
         if not OPENGL_AVAILABLE:
             return
-        import math as _m
-
         skin = self._skin_color
-        SEGS_U = 20   # longitude subdivisions (around)
-        SEGS_V = 16   # latitude subdivisions (pole to pole)
-        N = 4.0       # superellipsoid exponent (higher = more box-like)
+        SEGS_U, SEGS_V, N = 20, 16, 4.0
 
-        def _sgn(v):
-            return 1.0 if v >= 0 else -1.0
+        def _sgn(v): return 1.0 if v >= 0 else -1.0
 
-        def _se_pt(u, v):
-            """
-            Superellipsoid parametric surface.
-            u in [0, 2pi], v in [-pi/2, pi/2]
-            Returns (point, normal) scaled to head half-extents.
-            """
-            cu = _m.cos(u); su = _m.sin(u)
-            cv = _m.cos(v); sv = _m.sin(v)
-            # Superellipse terms with sign preservation
-            def _sp(val, exp):
+        def _se(u, v):
+            cu, su = math.cos(u), math.sin(u)
+            cv, sv = math.cos(v), math.sin(v)
+            e = 2.0 / N
+            def sp(val):
                 a = abs(val)
-                return _sgn(val) * (a ** exp if a > 1e-9 else 0.0)
-            e = 2.0 / N   # exponent for surface
-            px = hw * _sp(cu, e) * _sp(cv, e)
-            py = hh * _sp(sv, e)
-            pz = hd * _sp(su, e) * _sp(cv, e)
-            # Normal from gradient of implicit function
+                return _sgn(val) * (a ** e if a > 1e-9 else 0.0)
+            px = hw * sp(cu) * sp(cv)
+            py = hh * sp(sv)
+            pz = hd * sp(su) * sp(cv)
             ne = N - 1.0
             nx = (abs(cu*cv)**ne * _sgn(cu*cv)) / (hw + 1e-9)
             ny = (abs(sv)    **ne * _sgn(sv))    / (hh + 1e-9)
             nz = (abs(su*cv)**ne * _sgn(su*cv)) / (hd + 1e-9)
-            mag = _m.sqrt(nx*nx + ny*ny + nz*nz) + 1e-9
+            mag = math.sqrt(nx*nx + ny*ny + nz*nz) + 1e-9
             return (cx+px, cy+py, cz+pz), (nx/mag, ny/mag, nz/mag)
 
         glDisable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
         glColor3f(*skin)
 
-        # Draw as quad grid
         for j in range(SEGS_V):
-            v0 = -_m.pi/2 + _m.pi * j       / SEGS_V
-            v1 = -_m.pi/2 + _m.pi * (j+1)   / SEGS_V
+            v0 = -math.pi/2 + math.pi *  j      / SEGS_V
+            v1 = -math.pi/2 + math.pi * (j+1)   / SEGS_V
             for i in range(SEGS_U):
-                u0 = 2*_m.pi * i       / SEGS_U
-                u1 = 2*_m.pi * (i+1)   / SEGS_U
-                p00, n00 = _se_pt(u0, v0)
-                p01, n01 = _se_pt(u1, v0)
-                p10, n10 = _se_pt(u0, v1)
-                p11, n11 = _se_pt(u1, v1)
-                # Shade front face (z+) slightly warmer
-                if p00[2] > cz+hd*0.6 or p01[2] > cz+hd*0.6:
-                    glColor3f(skin[0]*1.02, skin[1]*0.99, skin[2]*0.94)
-                else:
-                    glColor3f(*skin)
+                u0 = 2*math.pi *  i      / SEGS_U
+                u1 = 2*math.pi * (i+1)   / SEGS_U
+                p00, n00 = _se(u0, v0)
+                p01, n01 = _se(u1, v0)
+                p10, n10 = _se(u0, v1)
+                p11, n11 = _se(u1, v1)
                 glBegin(GL_QUADS)
                 glNormal3f(*n00); glVertex3f(*p00)
                 glNormal3f(*n01); glVertex3f(*p01)
@@ -560,49 +567,41 @@ class AvatarViewerWidget(QOpenGLWidget):
                 glNormal3f(*n10); glVertex3f(*p10)
                 glEnd()
 
-        # ── Face features on front of head ────────────────────────────────────
+        # Face features
         glDisable(GL_LIGHTING)
         ez = cz + hd + 0.006
 
-        # Eyes — filled ovals
-        eye_rx = hw * 0.09; eye_ry = hh * 0.10
-        eye_y  = cy + hh * 0.08
+        # Eyes
         glColor3f(0.08, 0.06, 0.05)
-        for eye_cx in (cx - hw*0.27, cx + hw*0.27):
-            segs = 14
-            for i in range(segs):
-                a0 = 2*_m.pi * i       / segs
-                a1 = 2*_m.pi * (i+1)   / segs
-                glBegin(GL_TRIANGLES)
-                glVertex3f(eye_cx, eye_y, ez)
-                glVertex3f(eye_cx + eye_rx*_m.cos(a0), eye_y + eye_ry*_m.sin(a0), ez)
-                glVertex3f(eye_cx + eye_rx*_m.cos(a1), eye_y + eye_ry*_m.sin(a1), ez)
+        for ecx in (cx - hw*0.27, cx + hw*0.27):
+            ery, erx = hh*0.10, hw*0.09
+            ey = cy + hh*0.08
+            for i in range(14):
+                a0 = 2*math.pi *  i      / 14
+                a1 = 2*math.pi * (i+1)   / 14
+                glBegin(GL_QUADS)
+                glVertex3f(ecx, ey, ez)
+                glVertex3f(ecx + erx*math.cos(a0), ey + ery*math.sin(a0), ez)
+                glVertex3f(ecx + erx*math.cos(a1), ey + ery*math.sin(a1), ez)
+                glVertex3f(ecx, ey, ez)
                 glEnd()
 
-        # Smile — thick arc
-        sm_cx = cx; sm_cy = cy - hh*0.22
-        sm_rx = hw*0.28; sm_ry = hh*0.13; sm_th = hh*0.038
-        a_start = _m.radians(210); a_end = _m.radians(330)
-        sm_segs = 14
+        # Smile
         glColor3f(0.15, 0.08, 0.06)
-        for i in range(sm_segs):
-            a0 = a_start + (a_end - a_start) * i       / sm_segs
-            a1 = a_start + (a_end - a_start) * (i+1)   / sm_segs
-            ox0 = sm_cx+(sm_rx+sm_th)*_m.cos(a0); oy0 = sm_cy+(sm_ry+sm_th)*_m.sin(a0)
-            ox1 = sm_cx+(sm_rx+sm_th)*_m.cos(a1); oy1 = sm_cy+(sm_ry+sm_th)*_m.sin(a1)
-            ix0 = sm_cx+(sm_rx-sm_th)*_m.cos(a0); iy0 = sm_cy+(sm_ry-sm_th)*_m.sin(a0)
-            ix1 = sm_cx+(sm_rx-sm_th)*_m.cos(a1); iy1 = sm_cy+(sm_ry-sm_th)*_m.sin(a1)
+        scx, scy = cx, cy - hh*0.22
+        srx, sry, sth = hw*0.28, hh*0.13, hh*0.038
+        a0, a1 = math.radians(210), math.radians(330)
+        for i in range(14):
+            t0 = a0 + (a1-a0)*i/14
+            t1 = a0 + (a1-a0)*(i+1)/14
             glBegin(GL_QUADS)
-            glVertex3f(ox0,oy0,ez); glVertex3f(ox1,oy1,ez)
-            glVertex3f(ix1,iy1,ez); glVertex3f(ix0,iy0,ez)
+            glVertex3f(scx+(srx+sth)*math.cos(t0), scy+(sry+sth)*math.sin(t0), ez)
+            glVertex3f(scx+(srx+sth)*math.cos(t1), scy+(sry+sth)*math.sin(t1), ez)
+            glVertex3f(scx+(srx-sth)*math.cos(t1), scy+(sry-sth)*math.sin(t1), ez)
+            glVertex3f(scx+(srx-sth)*math.cos(t0), scy+(sry-sth)*math.sin(t0), ez)
             glEnd()
 
         glEnable(GL_LIGHTING)
-
-
-    def _draw_eyes(self, cx, cy, cz, hw, hh, hd):
-        """Legacy — now handled by _draw_roblox_head."""
-        pass
 
     def _paint_fallback(self):
         from PyQt6.QtGui import QPainter, QColor, QFont
@@ -611,5 +610,6 @@ class AvatarViewerWidget(QOpenGLWidget):
         p.setPen(QColor(137, 180, 250))
         p.setFont(QFont("Arial", 13))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                   "3D Preview requires PyOpenGL\n\npip install PyOpenGL PyOpenGL_accelerate")
+                   "3D Preview requires PyOpenGL\n\n"
+                   "pip install PyOpenGL PyOpenGL_accelerate")
         p.end()

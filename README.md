@@ -57,7 +57,7 @@ A free, open-source **desktop clothing editor** for Roblox — paint shirts and 
 
 ```bash
 # 1. Clone
-git clone https://github.com/cvipdebug/roblox-outfit-studio.git
+git clone https://github.com/YOUR_USERNAME/roblox-outfit-studio.git
 cd roblox-outfit-studio
 
 # 2. Create a virtual environment (recommended)

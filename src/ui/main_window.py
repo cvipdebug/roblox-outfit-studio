@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self._project_path: Optional[str] = None
         self._dirty: bool = False
         self._template_type: str = "shirt"
+        self._advanced_mode: bool = False
 
         # 3D texture sync throttle
         self._sync_timer = QTimer(self)
@@ -227,6 +228,11 @@ class MainWindow(QMainWindow):
         new_act.triggered.connect(self._on_new)
         file_menu.addAction(new_act)
 
+        adv_shirt_act = QAction("New Advanced Shirt Template…", self)
+        adv_shirt_act.setToolTip("Use the high-res advanced UV layout for more detail")
+        adv_shirt_act.triggered.connect(lambda: self._new_advanced_template("shirt"))
+        file_menu.addAction(adv_shirt_act)
+
         open_act = QAction("Open Project…", self)
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self._on_open)
@@ -339,6 +345,23 @@ class MainWindow(QMainWindow):
 
         # ── Canvas ────────────────────────────────────────────────────────
         canvas_menu = menubar.addMenu("Canvas")
+
+        uv_act = QAction("Show UV Overlay", self)
+        uv_act.setCheckable(True)
+        uv_act.setShortcut("U")
+        uv_act.triggered.connect(self._on_uv_overlay)
+        canvas_menu.addAction(uv_act)
+        self._uv_action = uv_act
+
+        canvas_menu.addSeparator()
+
+        export_adv_act = QAction("Export Advanced → Roblox Upload…", self)
+        export_adv_act.setShortcut("Ctrl+Shift+R")
+        export_adv_act.setToolTip("Convert advanced template layout to official Roblox format and save")
+        export_adv_act.triggered.connect(self._on_export_advanced)
+        canvas_menu.addAction(export_adv_act)
+
+        canvas_menu.addSeparator()
 
         # Symmetry submenu
         sym_menu = canvas_menu.addMenu("Symmetry")
@@ -579,9 +602,28 @@ class MainWindow(QMainWindow):
         self._apply_viewer_bg()
 
     def _push_texture_to_3d(self) -> None:
-        """Flatten canvas and upload to 3D viewer as appropriate texture."""
-        # Always use canvas_widget's canvas - it's authoritative (undo may have replaced it)
-        flat = self._canvas_widget.canvas.flatten()
+        """Flatten canvas and upload to 3D viewer as appropriate texture.
+
+        Advanced mode: ALL visible layers (including the guide) are flattened
+        together and then converted from advanced-UV space to Roblox-UV space.
+        The guide layer pixels only land in cells defined by ADV_REGIONS, so
+        they map to the correct faces on the 3D model — exactly what the user
+        wants to preview.
+
+        Standard mode: flatten and upload directly (already in Roblox-UV space).
+        """
+        canvas = self._canvas_widget.canvas
+
+        if self._advanced_mode:
+            # Flatten ALL visible layers — guide + paint layers together.
+            # advanced_to_roblox() will sample every ADV_REGION cell from this
+            # composite and paste it into the correct Roblox UV position.
+            flat = canvas.flatten()
+            from core.advanced_template import advanced_to_roblox
+            flat = advanced_to_roblox(flat, tmpl_type=self._template_type)
+        else:
+            flat = canvas.flatten()
+
         if self._template_type == "shirt":
             self._viewer_widget.update_shirt_texture(flat)
         else:
@@ -738,6 +780,152 @@ class MainWindow(QMainWindow):
                     f"Saved to:\n{path}\n\nUpload this file to Roblox Studio.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Export failed:\n{e}")
+
+    # ── Advanced template ────────────────────────────────────────────────────
+
+    def _new_advanced_template(self, tmpl_type: str = "shirt") -> None:
+        """Create a new canvas pre-loaded with the Dripzels advanced template guide PNG."""
+        if self._dirty and not self._confirm_discard():
+            return
+        import numpy as np
+        from PIL import Image as PILImage
+        w, h = 585, 559
+        self._canvas = CanvasState(width=w, height=h)
+
+        # Layer 1: blank painting canvas (bottom — user paints here)
+        self._canvas.add_layer("Background")
+
+        # Layer 2: the actual Dripzels advanced template PNG as a locked reference
+        guide = self._canvas.add_layer("Advanced UV Guide")
+        _tmpl_path = resource_path("assets", "templates", "advanced_template.png")
+        try:
+            _tmpl_img = PILImage.open(_tmpl_path).convert("RGBA").resize((w, h), PILImage.LANCZOS)
+            guide.pixels = np.array(_tmpl_img, dtype=np.uint8)
+        except Exception:
+            # Fallback: generated colour overlay if PNG missing
+            from core.advanced_template import draw_uv_overlay
+            _tmpl_img = draw_uv_overlay(w, h, mode="advanced")
+            guide.pixels = np.array(_tmpl_img, dtype=np.uint8)
+        guide.opacity = 0.85
+        guide.locked = True
+
+        # Layer 3: active paint layer
+        self._canvas.add_layer("Layer 1")
+        self._canvas.active_layer_index = 2
+
+        self._canvas_widget.canvas = self._canvas
+        self._canvas_widget._invalidate_cache()
+        self._layer_panel._canvas = self._canvas
+        self._layer_panel.refresh()
+        self._template_type = tmpl_type
+        self._advanced_mode = True
+        self._project_path = None
+        self._dirty = False
+        self._update_title()
+        self._status_label.setText(
+            "Advanced template loaded — paint inside the UV regions, "
+            "then Canvas → Export Advanced → Roblox Upload to convert.")
+
+    def _on_uv_overlay(self, checked: bool) -> None:
+        """Toggle UV region overlay on/off."""
+        from core.advanced_template import draw_uv_overlay
+        import numpy as np
+        # Find or create the UV Guide layer
+        for layer in self._canvas.layers:
+            if layer.name == "Advanced UV Guide":
+                layer.visible = checked
+                self._canvas_widget._invalidate_cache()
+                self._layer_panel.refresh()
+                self._push_texture_to_3d()
+                return
+        if checked:
+            # Create one on the fly
+            guide = self._canvas.add_layer("Advanced UV Guide")
+            overlay_img = draw_uv_overlay(self._canvas.width,
+                                          self._canvas.height, mode="advanced")
+            guide.pixels = np.array(overlay_img, dtype=np.uint8)
+            guide.opacity = 0.75
+            guide.locked = True
+            # Move to top
+            self._canvas.layers.append(self._canvas.layers.pop(
+                self._canvas.layers.index(guide)))
+            self._canvas_widget._invalidate_cache()
+            self._layer_panel.refresh()
+
+    def _on_export_advanced(self) -> None:
+        """Convert advanced-layout canvas to official Roblox 585x559 and export."""
+        from core.advanced_template import advanced_to_roblox
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PyQt6.QtGui import QPixmap as _QP
+        from PyQt6.QtCore import Qt as _Qt
+        import tempfile
+
+        # Flatten canvas (hide UV guide layer for export)
+        vis_states = {}
+        for layer in self._canvas.layers:
+            if layer.name == "Advanced UV Guide":
+                vis_states[id(layer)] = layer.visible
+                layer.visible = False
+        flat = self._canvas_widget.canvas.flatten()
+        for layer in self._canvas.layers:
+            if id(layer) in vis_states:
+                layer.visible = vis_states[id(layer)]
+
+        converted = advanced_to_roblox(flat, tmpl_type=self._template_type)
+
+        # Preview dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export Advanced → Roblox")
+        dlg.setMinimumWidth(500)
+        vl = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "<b>Advanced Template → Roblox Conversion</b><br>"
+            "Your painting will be remapped from the advanced UV layout<br>"
+            "to the official Roblox 585×559 shirt format."
+        )
+        info.setWordWrap(True)
+        vl.addWidget(info)
+
+        # Side-by-side preview
+        hl_prev = QHBoxLayout()
+        for title, img in [("Your Design (Advanced)", flat),
+                            ("Converted (Roblox Upload)", converted)]:
+            col = QVBoxLayout()
+            lbl = QLabel(title); lbl.setAlignment(_Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(lbl)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                img.save(tf.name)
+                pix = _QP(tf.name).scaledToWidth(220,
+                    _Qt.TransformationMode.SmoothTransformation)
+            img_lbl = QLabel(); img_lbl.setPixmap(pix)
+            img_lbl.setAlignment(_Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(img_lbl)
+            hl_prev.addLayout(col)
+        vl.addLayout(hl_prev)
+
+        hl = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        save_btn = QPushButton("Save Roblox PNG…"); save_btn.setDefault(True)
+        save_btn.clicked.connect(dlg.accept)
+        hl.addWidget(cancel_btn); hl.addWidget(save_btn)
+        vl.addLayout(hl)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Roblox Upload PNG",
+            "roblox_shirt_upload.png", "PNG Image (*.png)")
+        if path:
+            try:
+                converted.save(path, format="PNG")
+                self._status_label.setText(
+                    f"Exported Roblox-ready PNG: {os.path.basename(path)}")
+                QMessageBox.information(self, "Done!",
+                    f"Saved to:\n{path}\n\nUpload this to Roblox Studio.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
 
     def _on_symmetry(self, val: str) -> None:
         from core.models import SymmetryAxis as _SA
